@@ -20,6 +20,7 @@ def modify_bit_pos(bits, pos, val):
 
 def construct_full_raw_cmd(fanid, cmdid):
     preamble = '1111'
+    logging.info(f"Sending significant bits: {preamble} | {fanid} | {modify_bit_pos(cmdid, 2, '1')}")
     return construct_raw_bits_from_bits(preamble + fanid + modify_bit_pos(cmdid, 2, '1')) + PAUSE
 
 CMDS = {
@@ -47,14 +48,14 @@ def control_fan(room_name, cmd):
     full_cmd = SENDOOK + construct_full_raw_cmd(FAN_IDS[room_name], CMDS[cmd])
 
     # Log the command that's about to be executed
-    logging.info(f"Executing command: {full_cmd}")
+    logging.debug(f"Executing command: {full_cmd}")
 
     try:
         # Run the command, capturing stdout and stderr
         result = subprocess.run(full_cmd, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
         # Log successful execution
-        logging.info(f"Command executed successfully. Return code: {result.returncode}")
+        logging.info(f"Command executed. Return code: {result.returncode}")
 
         # If there's any output, log it at debug level
         if result.stdout:

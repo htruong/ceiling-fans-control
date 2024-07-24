@@ -3,7 +3,10 @@ import json
 import yaml
 import logging
 import time
+import threading
+
 from control_fan import control_fan
+from threading import Timer
 
 
 
@@ -25,6 +28,8 @@ DISCOVERY_PREFIX = 'homeassistant'
 COMMAND_TOPIC = 'set'
 STATE_TOPIC = 'state'
 AVAILABILITY_TOPIC = 'availability'
+
+fan_percentage_requests = {}
 
 def on_connect(client, userdata, flags, rc):
     logging.info(f"Connected with result code {rc}")
@@ -62,6 +67,58 @@ def on_connect(client, userdata, flags, rc):
 
     logging.info("All discovery messages published and topics subscribed")
 
+def delayed_fan_speed_change(client, room, percentage):
+    if room in fan_percentage_requests:
+        del fan_percentage_requests[room]
+    change_fan_speed_pct(client, room, percentage)
+
+def schedule_fan_speed_change(client, room, percentage):
+    if room in fan_percentage_requests:
+        fan_percentage_requests[room].cancel()
+
+    fan_percentage_requests[room] = Timer(1.5, delayed_fan_speed_change, args=[client, room, percentage])
+    fan_percentage_requests[room].start()
+
+    # Respond with fake fan speed feedback right away
+    snapped_speed = round(((100 - percentage) / 100) * 6) # 0->6, 0 is fastest
+    state_payload = None
+    if snapped_speed == 6:
+        state_payload = {
+            'state': 'OFF',
+            'percentage': 0
+        }
+    else:
+        snapped_pct = round(100 - (snapped_speed * 100/6)) 
+        state_payload = {
+            'state': 'ON',
+            'percentage': snapped_pct
+        }
+    if state_payload is not None:
+        client.publish(f"{DISCOVERY_PREFIX}/fan/{room}_fan/{STATE_TOPIC}", json.dumps(state_payload), retain=True)
+
+
+def change_fan_speed_pct(client, room, percentage):
+    snapped_speed = round(((100 - percentage) / 100) * 6) # 0->6, 0 is fastest
+    state_payload = None
+    if snapped_speed == 6:
+        control_fan(room, 'stop')
+        state_payload = {
+            'state': 'OFF',
+            'percentage': 0
+        }
+    else:
+        speed = 'speed' + str(snapped_speed + 1)
+        snapped_pct = round(100 - (snapped_speed * 100/6)) 
+        logging.info(f"Snapped fan speed percentage: {snapped_pct}")
+        control_fan(room, speed)
+        state_payload = {
+            'state': 'ON',
+            'percentage': snapped_pct
+        }
+
+    if state_payload is not None:
+        client.publish(f"{DISCOVERY_PREFIX}/fan/{room}_fan/{STATE_TOPIC}", json.dumps(state_payload), retain=True)
+
 def on_message(client, userdata, msg):
     logging.info(f"Received message on topic: {msg.topic}")
     logging.info(f"Message payload: {msg.payload}")
@@ -71,42 +128,25 @@ def on_message(client, userdata, msg):
         room = topic_parts[2].replace('_fan', '').replace('_light', '')
         device_type = 'light' if 'light' in topic_parts[2] else 'fan'
         payload = msg.payload.decode()
-        state_payload = {}
+        state_payload = None
         logging.info(f"Received command for {room} {device_type}: {payload}")
 
         if device_type == 'fan':
             if '/speed/percentage/' in msg.topic:
                 percentage = int(payload)
-                snapped_speed = round(((100 - percentage) / 100) * 6) # 0->6, 0 is fastest
-                if snapped_speed == 6:
-                    control_fan(room, 'stop')
-                    state_payload = {
-                        'state': 'OFF',
-                        'percentage': 0
-                    }
-                else:
-                    speed = 'speed' + str(snapped_speed + 1)
-                    snapped_pct = round(100 - (snapped_speed * 100/6)) 
-                    control_fan(room, speed)
-                    state_payload = {
-                        'state': 'ON',
-                        'percentage': snapped_pct
-                    }
+                schedule_fan_speed_change(client, room, percentage)
             elif '/direction/' in msg.topic:
                 control_fan(room, 'reverse')
                 state_payload = {
                     'direction': payload
                 }
             elif '/on/' in msg.topic:
-                control_fan(room, 'stop' if payload == 'OFF' else 'speed4')
-                state_payload = {
-                    'state': payload,
-                    'percentage': 33
-                }
+                percentage = 0 if payload == 'OFF' else 35
+                schedule_fan_speed_change(client, room, percentage)
             else:
                 logging.info(f"Payload WTF?")
-
-            client.publish(f"{DISCOVERY_PREFIX}/fan/{room}_fan/{STATE_TOPIC}", json.dumps(state_payload), retain=True)
+            if state_payload is not None:
+                client.publish(f"{DISCOVERY_PREFIX}/fan/{room}_fan/{STATE_TOPIC}", json.dumps(state_payload), retain=True)
 
         elif device_type == 'light':
             try:
@@ -172,7 +212,7 @@ def publish_discovery_fan(client, room):
         "direction_value_template": "{{ value_json.direction }}",
         "optimistic": False,
         "qos": 0,
-        "retain": True
+        "retain": False
     }
     discovery_topic = f"{DISCOVERY_PREFIX}/fan/{room}_fan/config"
     logging.info(f"Publishing fan discovery message to topic: {discovery_topic}")
@@ -201,7 +241,7 @@ def publish_discovery_light(client, room):
         "state_value_template": "{{ value_json.state }}",
         "optimistic": False,
         "qos": 0,
-        "retain": True
+        "retain": False
     }
     discovery_topic = f"{DISCOVERY_PREFIX}/light/{room}_fan_light/config"
     logging.info(f"Publishing light discovery message to topic: {discovery_topic}")
