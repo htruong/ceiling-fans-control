@@ -21,13 +21,13 @@ Install prereqs:
 sudo apt install python3-paho-mqtt python3-yaml
 ```
 
-Enter your remote ids into the config file, you should be ready to go. The easiest is to run the `onlyfansd` directly with python3:
+Enter your remote ids into the config file, rename it to `config.yaml`, you should be ready to go. The easiest is to run the `onlyfansd` directly with python3:
 
 ```
 python3 onlyfansd.py
 ```
 
-Just add the MQTT integration to HomeAssistant, you'll see the fans you configured appearing as a fan entity and a light entity. 
+Just add the MQTT integration to HomeAssistant, you'll see each of the fans you configured appearing as a fan entity and a light entity. 
 
 If you can't control To debug, you should compare the signal that this daemon sends out and the actual signal that the remote sends out to understand what went wrong. Or you could spend some more minutes to figure out how the SET button works, and then add a program button to the integration. I can't be bothered to figure out how the SET button works, to send arbitrary ID we choose to the fans, but [I assume that's possible](https://www.amazon.com/review/R2VWOTH0LUT4XJ/).
 
