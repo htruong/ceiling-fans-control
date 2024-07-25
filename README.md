@@ -10,7 +10,7 @@ Sending the remote control signal
 
 You can use a vanilla raspberry pi of any kind to transmit control signals (I used a Pi 0), using [rpitx](https://github.com/F5OEO/rpitx), at least in a hacky way, [without additional or customized hardware](https://www.youtube.com/watch?v=3lGU7PjJM7k). 
 
-Note that this only serves as a remote control, as we doesn't know what the fans are actually doing, we just send commands blindly and hope it works just like the remotes.
+Note that this only serves as a remote control, as we don't know what the fans are actually doing: we just send commands blindly and hope it works, just like the remotes.
 
 How to use this repository
 --
