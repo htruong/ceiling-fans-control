@@ -21,6 +21,7 @@ FANS = config['fans']
 fan_states = {}
 light_states = {}
 fan_percentage_requests = {}
+homekit_bridge = None
 
 
 def ha_set_state(entity_id, state, attributes=None):
@@ -38,6 +39,8 @@ def ha_set_state(entity_id, state, attributes=None):
 
 def set_fan_state(room, state):
     fan_states[room] = state
+    if homekit_bridge:
+        homekit_bridge.update_fan(room, state)
     ha_set_state(
         f'fan.{room}_fan',
         state['state'].lower(),
@@ -52,6 +55,8 @@ def set_fan_state(room, state):
 
 def set_light_state(room, state):
     light_states[room] = state
+    if homekit_bridge:
+        homekit_bridge.update_light(room, state)
     ha_set_state(
         f'light.{room}_fan_light',
         state['state'].lower(),
@@ -187,6 +192,19 @@ def on_ws_close(ws, close_status_code, close_msg):
 
 
 def main():
+    global homekit_bridge
+    hk_config = config.get('homekit')
+    if hk_config and hk_config.get('enabled'):
+        from homekit_bridge import HomeKitBridge
+        homekit_bridge = HomeKitBridge(
+            fans=FANS,
+            port=hk_config.get('port', 51826),
+            persist_file=hk_config.get('persist_file', 'homekit.state'),
+            on_fan_command=lambda room, service, data: handle_service_call('fan', service, [f'fan.{room}_fan'], data),
+            on_light_command=lambda room, service, data: handle_service_call('light', service, [f'light.{room}_fan_light'], data),
+        )
+        homekit_bridge.start()
+
     init_entities()
 
     ws_url = HA_URL.replace('https://', 'wss://').replace('http://', 'ws://') + '/api/websocket'
