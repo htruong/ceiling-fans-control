@@ -1,8 +1,6 @@
-mqtt:
-  broker: your_server.lan
-  port: 1883
-  username: 
-  password: 
+homeassistant:
+  url: http://homeassistant.local:8123
+  token: your_long_lived_access_token
 
 fans:
   living_room:  '00000000000'

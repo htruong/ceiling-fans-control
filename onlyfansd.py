@@ -1,282 +1,211 @@
-import paho.mqtt.client as mqtt
 import json
 import yaml
 import logging
 import time
-import threading
-
-from control_fan import control_fan
+import requests
+import websocket
 from threading import Timer
 
+from control_fan import control_fan
 
 
-# Set up logging
-logging.basicConfig(level=logging.info, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Load configuration
 with open('config.yaml', 'r') as config_file:
     config = yaml.safe_load(config_file)
 
-MQTT_BROKER = config['mqtt']['broker']
-MQTT_PORT = config['mqtt']['port']
-MQTT_USERNAME = config.get('mqtt', {}).get('username')
-MQTT_PASSWORD = config.get('mqtt', {}).get('password')
+HA_URL = config['homeassistant']['url'].rstrip('/')
+HA_TOKEN = config['homeassistant']['token']
 FANS = config['fans']
 
-# MQTT topics
-DISCOVERY_PREFIX = 'homeassistant'
-COMMAND_TOPIC = 'set'
-STATE_TOPIC = 'state'
-AVAILABILITY_TOPIC = 'availability'
-
+fan_states = {}
+light_states = {}
 fan_percentage_requests = {}
 
-def on_connect(client, userdata, flags, rc):
-    logging.info(f"Connected with result code {rc}")
-    client.publish(f"{DISCOVERY_PREFIX}/status", "online", retain=True)
 
-    # Publish initial states for all fans and lights
-    publish_initial_states(client)
+def ha_set_state(entity_id, state, attributes=None):
+    headers = {
+        'Authorization': f'Bearer {HA_TOKEN}',
+        'Content-Type': 'application/json',
+    }
+    body = {'state': state, 'attributes': attributes or {}}
+    try:
+        r = requests.post(f'{HA_URL}/api/states/{entity_id}', headers=headers, json=body, timeout=5)
+        r.raise_for_status()
+    except Exception as e:
+        logging.error(f"Failed to set state for {entity_id}: {e}")
 
-    # Publish discovery messages and subscribe to topics for each room
+
+def set_fan_state(room, state):
+    fan_states[room] = state
+    ha_set_state(
+        f'fan.{room}_fan',
+        state['state'].lower(),
+        {
+            'percentage': state['percentage'],
+            'direction': state.get('direction', 'forward'),
+            'supported_features': 5,  # SET_SPEED + DIRECTION
+            'friendly_name': room.replace('_', ' ').title() + ' Fan',
+        }
+    )
+
+
+def set_light_state(room, state):
+    light_states[room] = state
+    ha_set_state(
+        f'light.{room}_fan_light',
+        state['state'].lower(),
+        {'friendly_name': room.replace('_', ' ').title() + ' Fan Light'}
+    )
+
+
+def init_entities():
+    logging.info("Initialising entities in Home Assistant...")
     for room in FANS:
-	# Clear retained messages
-        client.publish(f"{DISCOVERY_PREFIX}/fan/{room}_fan/on/{COMMAND_TOPIC}", "", retain=True)
-        client.publish(f"{DISCOVERY_PREFIX}/fan/{room}_fan/speed/percentage/{COMMAND_TOPIC}", "", retain=True)
-        client.publish(f"{DISCOVERY_PREFIX}/fan/{room}_fan/direction/{COMMAND_TOPIC}", "", retain=True)
-        client.publish(f"{DISCOVERY_PREFIX}/light/{room}_fan_light/{COMMAND_TOPIC}", "", retain=True)
-        logging.info(f"Cleared all previous states and commands for {room}")
+        set_fan_state(room, {'state': 'OFF', 'percentage': 0, 'direction': 'forward'})
+        set_light_state(room, {'state': 'OFF'})
+    logging.info("Entities initialised")
 
-        publish_discovery_fan(client, room)
-        publish_discovery_light(client, room)
-        logging.info(f"Published all devices")
 
-        # Subscribe to fan topics
-        fan_command_topic = f"{DISCOVERY_PREFIX}/fan/{room}_fan/on/{COMMAND_TOPIC}"
-        fan_percentage_topic = f"{DISCOVERY_PREFIX}/fan/{room}_fan/speed/percentage/{COMMAND_TOPIC}"
-        fan_direction_topic = f"{DISCOVERY_PREFIX}/fan/{room}_fan/direction/{COMMAND_TOPIC}"
-        client.subscribe(fan_command_topic)
-        client.subscribe(fan_percentage_topic)
-        client.subscribe(fan_direction_topic)
-        logging.info(f"Subscribed to fan topics: {fan_command_topic}, {fan_percentage_topic}, {fan_direction_topic}")
+def delayed_fan_speed_change(room, percentage):
+    fan_percentage_requests.pop(room, None)
+    change_fan_speed_pct(room, percentage)
 
-        # Subscribe to light topic
-        light_command_topic = f"{DISCOVERY_PREFIX}/light/{room}_fan_light/{COMMAND_TOPIC}"
-        client.subscribe(light_command_topic)
-        logging.info(f"Subscribed to light topic: {light_command_topic}")
 
-    logging.info("All discovery messages published and topics subscribed")
-
-def delayed_fan_speed_change(client, room, percentage):
-    if room in fan_percentage_requests:
-        del fan_percentage_requests[room]
-    change_fan_speed_pct(client, room, percentage)
-
-def schedule_fan_speed_change(client, room, percentage):
+def schedule_fan_speed_change(room, percentage):
     if room in fan_percentage_requests:
         fan_percentage_requests[room].cancel()
 
-    fan_percentage_requests[room] = Timer(1.5, delayed_fan_speed_change, args=[client, room, percentage])
+    fan_percentage_requests[room] = Timer(1.5, delayed_fan_speed_change, args=[room, percentage])
     fan_percentage_requests[room].start()
 
-    # Respond with fake fan speed feedback right away
-    snapped_speed = round(((100 - percentage) / 100) * 6) # 0->6, 0 is fastest
-    state_payload = None
+    # Immediate snapped feedback
+    snapped_speed = round(((100 - percentage) / 100) * 6)
+    direction = fan_states.get(room, {}).get('direction', 'forward')
     if snapped_speed == 6:
-        state_payload = {
-            'state': 'OFF',
-            'percentage': 0
-        }
+        set_fan_state(room, {'state': 'OFF', 'percentage': 0, 'direction': direction})
     else:
-        snapped_pct = round(100 - (snapped_speed * 100/6)) 
-        state_payload = {
-            'state': 'ON',
-            'percentage': snapped_pct
-        }
-    if state_payload is not None:
-        client.publish(f"{DISCOVERY_PREFIX}/fan/{room}_fan/{STATE_TOPIC}", json.dumps(state_payload), retain=True)
+        snapped_pct = round(100 - (snapped_speed * 100 / 6))
+        set_fan_state(room, {'state': 'ON', 'percentage': snapped_pct, 'direction': direction})
 
 
-def change_fan_speed_pct(client, room, percentage):
-    snapped_speed = round(((100 - percentage) / 100) * 6) # 0->6, 0 is fastest
-    state_payload = None
+def change_fan_speed_pct(room, percentage):
+    snapped_speed = round(((100 - percentage) / 100) * 6)
+    direction = fan_states.get(room, {}).get('direction', 'forward')
     if snapped_speed == 6:
         control_fan(room, 'stop')
-        state_payload = {
-            'state': 'OFF',
-            'percentage': 0
-        }
+        set_fan_state(room, {'state': 'OFF', 'percentage': 0, 'direction': direction})
     else:
         speed = 'speed' + str(snapped_speed + 1)
-        snapped_pct = round(100 - (snapped_speed * 100/6)) 
-        logging.info(f"Snapped fan speed percentage: {snapped_pct}")
+        snapped_pct = round(100 - (snapped_speed * 100 / 6))
+        logging.info(f"Fan {room} snapped to {speed} ({snapped_pct}%)")
         control_fan(room, speed)
-        state_payload = {
-            'state': 'ON',
-            'percentage': snapped_pct
-        }
+        set_fan_state(room, {'state': 'ON', 'percentage': snapped_pct, 'direction': direction})
 
-    if state_payload is not None:
-        client.publish(f"{DISCOVERY_PREFIX}/fan/{room}_fan/{STATE_TOPIC}", json.dumps(state_payload), retain=True)
 
-def on_message(client, userdata, msg):
-    logging.info(f"Received message on topic: {msg.topic}")
-    logging.info(f"Message payload: {msg.payload}")
+def handle_service_call(domain, service, entity_ids, service_data):
+    if isinstance(entity_ids, str):
+        entity_ids = [entity_ids]
 
-    try:
-        topic_parts = msg.topic.split('/')
-        room = topic_parts[2].replace('_fan', '').replace('_light', '')
-        device_type = 'light' if 'light' in topic_parts[2] else 'fan'
-        payload = msg.payload.decode()
-        state_payload = None
-        logging.info(f"Received command for {room} {device_type}: {payload}")
-
-        if device_type == 'fan':
-            if '/speed/percentage/' in msg.topic:
-                percentage = int(payload)
-                schedule_fan_speed_change(client, room, percentage)
-            elif '/direction/' in msg.topic:
+    for entity_id in entity_ids:
+        if domain == 'fan' and entity_id.startswith('fan.') and entity_id.endswith('_fan'):
+            room = entity_id[len('fan.'):-len('_fan')]
+            if room not in FANS:
+                continue
+            logging.info(f"Fan command: {room} {service} {service_data}")
+            if service == 'turn_on':
+                schedule_fan_speed_change(room, service_data.get('percentage', 35))
+            elif service == 'turn_off':
+                schedule_fan_speed_change(room, 0)
+            elif service == 'set_percentage':
+                schedule_fan_speed_change(room, service_data.get('percentage', 0))
+            elif service == 'set_direction':
                 control_fan(room, 'reverse')
-                state_payload = {
-                    'direction': payload
-                }
-            elif '/on/' in msg.topic:
-                percentage = 0 if payload == 'OFF' else 35
-                schedule_fan_speed_change(client, room, percentage)
-            else:
-                logging.info(f"Payload WTF?")
-            if state_payload is not None:
-                client.publish(f"{DISCOVERY_PREFIX}/fan/{room}_fan/{STATE_TOPIC}", json.dumps(state_payload), retain=True)
+                current = fan_states.get(room, {'state': 'OFF', 'percentage': 0, 'direction': 'forward'})
+                current['direction'] = service_data.get('direction', 'forward')
+                set_fan_state(room, current)
 
-        elif device_type == 'light':
-            try:
-                payload_dict = json.loads(payload)
-            except json.JSONDecodeError:
-                payload_dict = {"state": payload}
-
-            if 'state' in payload_dict:
-                if payload_dict['state'] in ['ON', 'OFF']:
-                    control_fan(room, 'light')
-
-            state_payload = {
-                'state': payload_dict.get('state', 'ON')
-            }
-            client.publish(f"{DISCOVERY_PREFIX}/light/{room}_fan_light/{STATE_TOPIC}", json.dumps(state_payload), retain=True)
-
-    except Exception as e:
-        logging.error(f"Error processing message: {e}")
+        elif domain == 'light' and entity_id.startswith('light.') and entity_id.endswith('_fan_light'):
+            room = entity_id[len('light.'):-len('_fan_light')]
+            if room not in FANS:
+                continue
+            logging.info(f"Light command: {room} {service}")
+            if service in ('turn_on', 'turn_off', 'toggle'):
+                control_fan(room, 'light')
+                current_on = light_states.get(room, {}).get('state', 'OFF') == 'ON'
+                if service == 'turn_on':
+                    new_state = 'ON'
+                elif service == 'turn_off':
+                    new_state = 'OFF'
+                else:
+                    new_state = 'OFF' if current_on else 'ON'
+                set_light_state(room, {'state': new_state})
 
 
-def publish_initial_states(client):
-    logging.info("Publishing initial states for all fans and lights")
-    logging.info(f"FANS: {FANS}")
-    for room in FANS:
-        # Publish initial state for fan
-        fan_initial_state = {
-            'state': 'OFF',
-            'percentage': 0,
-            'direction': 'forward'
-        }
-        fan_state_topic = f"{DISCOVERY_PREFIX}/fan/{room}_fan/{STATE_TOPIC}"
-        logging.info(f"Publishing initial state for fan {room}: {fan_initial_state}")
-        client.publish(fan_state_topic, json.dumps(fan_initial_state), retain=True)
-        logging.info(f"Published initial state for fan {room}: {fan_initial_state}")
+ws_msg_id = 1
 
-        # Publish initial state for light
-        light_initial_state = {
-            'state': 'OFF'
-        }
-        light_state_topic = f"{DISCOVERY_PREFIX}/light/{room}_fan_light/{STATE_TOPIC}"
-        logging.info(f"Publishing initial state for light {room}: {light_initial_state}")
-        client.publish(light_state_topic, json.dumps(light_initial_state), retain=True)
-        logging.info(f"Published initial state for light {room}: {light_initial_state}")
-    logging.info("Publishing initial states for all fans and lights - DONE")
+def on_ws_message(ws, message):
+    global ws_msg_id
+    data = json.loads(message)
+    msg_type = data.get('type')
 
-def publish_discovery_fan(client, room):
-    logging.info(f"Publish fan: {room}...")
-    payload = {
-        "name": f"{room.replace('_', ' ').title()} Fan",
-        "unique_id": f"fan_{room}",
-        "command_topic": f"{DISCOVERY_PREFIX}/fan/{room}_fan/on/{COMMAND_TOPIC}",
-        "state_topic": f"{DISCOVERY_PREFIX}/fan/{room}_fan/{STATE_TOPIC}",
-        "availability_topic": f"{DISCOVERY_PREFIX}/fan/{room}_fan/{AVAILABILITY_TOPIC}",
-        "payload_available": "online",
-        "payload_not_available": "offline",
-        "state_value_template": "{{ value_json.state }}",
-        "percentage_command_topic": f"{DISCOVERY_PREFIX}/fan/{room}_fan/speed/percentage/{COMMAND_TOPIC}",
-        "percentage_command_template": "{{ value }}",
-        "percentage_state_topic": f"{DISCOVERY_PREFIX}/fan/{room}_fan/{STATE_TOPIC}",
-        "percentage_value_template": "{{ value_json.percentage }}",
-        "direction_command_topic": f"{DISCOVERY_PREFIX}/fan/{room}_fan/direction/{COMMAND_TOPIC}",
-        "direction_state_topic": f"{DISCOVERY_PREFIX}/fan/{room}_fan/{STATE_TOPIC}",
-        "direction_value_template": "{{ value_json.direction }}",
-        "optimistic": False,
-        "qos": 0,
-        "retain": False
-    }
-    discovery_topic = f"{DISCOVERY_PREFIX}/fan/{room}_fan/config"
-    logging.info(f"Publishing fan discovery message to topic: {discovery_topic}")
-    logging.info(f"Fan discovery payload: {json.dumps(payload)}")
-    client.publish(discovery_topic, json.dumps(payload), retain=True)
-    client.publish(f"{DISCOVERY_PREFIX}/fan/{room}_fan/{AVAILABILITY_TOPIC}", "online", retain=True)
+    if msg_type == 'auth_required':
+        ws.send(json.dumps({'type': 'auth', 'access_token': HA_TOKEN}))
 
-    # Publish initial state
-    initial_state = {
-        'state': 'OFF',
-        'percentage': 0,
-        'direction': 'forward'
-    }
-    client.publish(f"{DISCOVERY_PREFIX}/fan/{room}_fan/{STATE_TOPIC}", json.dumps(initial_state), retain=True)
+    elif msg_type == 'auth_ok':
+        logging.info("Authenticated with Home Assistant WebSocket")
+        ws_msg_id += 1
+        ws.send(json.dumps({'id': ws_msg_id, 'type': 'subscribe_events', 'event_type': 'call_service'}))
 
-def publish_discovery_light(client, room):
-    logging.info(f"Publish fan light: {room}...")
-    payload = {
-        "name": f"{room.replace('_', ' ').title()} Fan Light",
-        "unique_id": f"light_{room}_fan",
-        "command_topic": f"{DISCOVERY_PREFIX}/light/{room}_fan_light/{COMMAND_TOPIC}",
-        "state_topic": f"{DISCOVERY_PREFIX}/light/{room}_fan_light/{STATE_TOPIC}",
-        "availability_topic": f"{DISCOVERY_PREFIX}/light/{room}_fan_light/{AVAILABILITY_TOPIC}",
-        "payload_available": "online",
-        "payload_not_available": "offline",
-        "state_value_template": "{{ value_json.state }}",
-        "optimistic": False,
-        "qos": 0,
-        "retain": False
-    }
-    discovery_topic = f"{DISCOVERY_PREFIX}/light/{room}_fan_light/config"
-    logging.info(f"Publishing light discovery message to topic: {discovery_topic}")
-    logging.info(f"Light discovery payload: {json.dumps(payload)}")
-    client.publish(discovery_topic, json.dumps(payload), retain=True)
-    client.publish(f"{DISCOVERY_PREFIX}/light/{room}_fan_light/{AVAILABILITY_TOPIC}", "online", retain=True)
+    elif msg_type == 'auth_invalid':
+        logging.error("Home Assistant authentication failed — check your token")
+        ws.close()
 
-    # Publish initial state
-    initial_state = {
-        'state': 'OFF'
-    }
-    client.publish(f"{DISCOVERY_PREFIX}/light/{room}_fan_light/{STATE_TOPIC}", json.dumps(initial_state), retain=True)
+    elif msg_type == 'event':
+        event_data = data.get('event', {}).get('data', {})
+        domain = event_data.get('domain', '')
+        service = event_data.get('service', '')
+        service_data = event_data.get('service_data', {})
+
+        # HA 2022+ puts targets in 'target', older versions put entity_id in service_data
+        target = event_data.get('target', {})
+        entity_ids = target.get('entity_id') or service_data.get('entity_id', [])
+
+        if domain in ('fan', 'light') and entity_ids:
+            handle_service_call(domain, service, entity_ids, service_data)
+
+    elif msg_type == 'result' and not data.get('success'):
+        logging.warning(f"WebSocket command failed: {data}")
 
 
-def on_subscribe(client, userdata, mid, granted_qos):
-    logging.info(f"Subscribed successfully. Message ID: {mid}, Granted QoS: {granted_qos}")
+def on_ws_error(ws, error):
+    logging.error(f"WebSocket error: {error}")
+
+
+def on_ws_close(ws, close_status_code, close_msg):
+    logging.info(f"WebSocket closed (code={close_status_code})")
+
 
 def main():
-    client = mqtt.Client(clean_session=True)
-    client.on_connect = on_connect
-    client.on_message = on_message
-    client.on_subscribe = on_subscribe
+    init_entities()
 
-    if MQTT_USERNAME and MQTT_PASSWORD:
-        client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+    ws_url = HA_URL.replace('https://', 'wss://').replace('http://', 'ws://') + '/api/websocket'
+    logging.info(f"Connecting to {ws_url}")
 
     while True:
         try:
-            logging.info(f"Attempting to connect to MQTT broker at {MQTT_BROKER}:{MQTT_PORT}")
-            client.connect(MQTT_BROKER, MQTT_PORT, 60)
-            client.loop_forever()
+            ws = websocket.WebSocketApp(
+                ws_url,
+                on_message=on_ws_message,
+                on_error=on_ws_error,
+                on_close=on_ws_close,
+            )
+            ws.run_forever()
         except Exception as e:
-            logging.error(f"Connection failed: {e}")
-            time.sleep(10)  # Wait before trying to reconnect
+            logging.error(f"WebSocket connection failed: {e}")
+        logging.info("Reconnecting in 10 seconds...")
+        time.sleep(10)
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     main()
-
