@@ -16,9 +16,9 @@ class CeilingFanAccessory(Accessory):
         self.on_light_command = on_light_command
         self._light_on = False
 
-        fan_service = self.add_preload_service('Fan')
+        fan_service = self.add_preload_service('Fan', chars=['RotationSpeed'])
         self.char_active = fan_service.configure_char(
-            'Active', setter_callback=self._set_active)
+            'On', setter_callback=self._set_active)
         self.char_speed = fan_service.configure_char(
             'RotationSpeed', setter_callback=self._set_speed)
 
@@ -44,8 +44,7 @@ class CeilingFanAccessory(Accessory):
             self.on_light_command(self.room, 'toggle', {})
 
     def update_fan(self, state):
-        active = 1 if state['state'] == 'ON' else 0
-        self.char_active.set_value(active)
+        self.char_active.set_value(state['state'] == 'ON')
         self.char_speed.set_value(state.get('percentage', 0))
 
     def update_light(self, state):
