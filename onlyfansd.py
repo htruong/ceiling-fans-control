@@ -22,6 +22,28 @@ fan_states = {}
 light_states = {}
 fan_percentage_requests = {}
 homekit_bridge = None
+STATE_FILE = 'fan_state.json'
+
+
+def save_state():
+    try:
+        with open(STATE_FILE, 'w') as f:
+            json.dump({'fans': fan_states, 'lights': light_states}, f)
+    except Exception as e:
+        logging.error(f"Failed to save state: {e}")
+
+
+def load_state():
+    try:
+        with open(STATE_FILE, 'r') as f:
+            data = json.load(f)
+            fan_states.update(data.get('fans', {}))
+            light_states.update(data.get('lights', {}))
+        logging.info("Loaded persisted state")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logging.error(f"Failed to load state: {e}")
 
 
 def ha_set_state(entity_id, state, attributes=None):
@@ -39,6 +61,7 @@ def ha_set_state(entity_id, state, attributes=None):
 
 def set_fan_state(room, state):
     fan_states[room] = state
+    save_state()
     if homekit_bridge:
         homekit_bridge.update_fan(room, state)
     ha_set_state(
@@ -55,6 +78,7 @@ def set_fan_state(room, state):
 
 def set_light_state(room, state):
     light_states[room] = state
+    save_state()
     if homekit_bridge:
         homekit_bridge.update_light(room, state)
     ha_set_state(
@@ -67,8 +91,8 @@ def set_light_state(room, state):
 def init_entities():
     logging.info("Initialising entities in Home Assistant...")
     for room in FANS:
-        set_fan_state(room, {'state': 'OFF', 'percentage': 0, 'direction': 'forward'})
-        set_light_state(room, {'state': 'OFF'})
+        set_fan_state(room, fan_states.get(room, {'state': 'OFF', 'percentage': 0, 'direction': 'forward'}))
+        set_light_state(room, light_states.get(room, {'state': 'OFF'}))
     logging.info("Entities initialised")
 
 
@@ -205,6 +229,7 @@ def main():
         )
         homekit_bridge.start()
 
+    load_state()
     init_entities()
 
     ws_url = HA_URL.replace('https://', 'wss://').replace('http://', 'ws://') + '/api/websocket'
