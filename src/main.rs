@@ -1,3 +1,5 @@
+mod homekit;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -5,6 +7,7 @@ use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::process::Stdio;
 use tokio::process::Command as ProcCommand;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
@@ -15,14 +18,54 @@ use tracing::{error, info, warn};
 
 #[derive(Deserialize)]
 struct Config {
-    homeassistant: HaConfig,
+    #[serde(default)]
+    homeassistant: Option<HaConfig>,
     fans: HashMap<String, String>, // room → 14-bit fan ID string
+    #[serde(default)]
+    homekit: Option<HomeKitConfig>,
 }
 
 #[derive(Deserialize)]
 struct HaConfig {
+    #[serde(default = "default_true")]
+    enabled: bool,
     url: String,
     token: String,
+}
+
+fn default_true() -> bool { true }
+
+#[derive(Deserialize)]
+struct HomeKitConfig {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "default_hk_port")]
+    port: u16,
+    #[serde(default = "default_hk_persist")]
+    persist_dir: String,
+    #[serde(default = "default_hk_pin")]
+    pin: String,  // 8 digits, e.g. "03141592"
+    #[serde(default)]
+    name: Option<String>,
+}
+
+fn default_hk_port() -> u16 { 51826 }
+fn default_hk_persist() -> String { "homekit".into() }
+fn default_hk_pin() -> String { "03141592".into() }
+
+fn hostname() -> String {
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "onlyfansd".into())
+}
+
+fn parse_pin(s: &str) -> [u8; 8] {
+    let digits: Vec<u8> = s.chars().filter_map(|c| c.to_digit(10).map(|d| d as u8)).collect();
+    let mut out = [0u8; 8];
+    for (i, d) in digits.iter().take(8).enumerate() { out[i] = *d; }
+    out
 }
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -104,14 +147,16 @@ async fn send_rf(fan_id: &str, cmd: &str) {
         Some(c) => c,
         None => { error!("Unknown RF command: {}", cmd); return; }
     };
-    info!("RF {} fan_id={}", cmd, fan_id);
+    let args = ["-f", "304300000", "-0", "333", "-1", "333", chips.as_str()];
+    info!("exec: sendook {}", args.join(" "));
     match ProcCommand::new("sendook")
-        .args(["-f", "304300000", "-0", "333", "-1", "333", chips.as_str()])
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .await
     {
-        Ok(s) if s.success() => {}
-        Ok(s) => error!("sendook exit {:?}", s.code()),
+        Ok(s) => info!("sendook exit={}", s.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into())),
         Err(e) => error!("sendook failed: {}", e),
     }
 }
@@ -170,6 +215,7 @@ struct Daemon {
     config: Config,
     client: Client,
     state: Mutex<SharedState>,
+    homekit: Option<Arc<homekit::HomeKit>>,
 }
 
 impl Daemon {
@@ -179,14 +225,20 @@ impl Daemon {
         let mut state = SharedState::new();
         state.fan_states = persisted.fans;
         state.light_states = persisted.lights;
-        Self { config, client: Client::new(), state: Mutex::new(state) }
+        Self { config, client: Client::new(), state: Mutex::new(state), homekit: None }
+    }
+
+    /// Returns the HA config only when it's present AND enabled.
+    fn ha(&self) -> Option<&HaConfig> {
+        self.config.homeassistant.as_ref().filter(|h| h.enabled)
     }
 
     async fn sync_fan_to_ha(&self, room: &str, st: &FanState) {
+        let Some(ha) = self.ha() else { return; };
         ha_set_state(
             &self.client,
-            &self.config.homeassistant.url,
-            &self.config.homeassistant.token,
+            &ha.url,
+            &ha.token,
             &format!("fan.{}_fan", room),
             &st.state.to_lowercase(),
             json!({
@@ -199,10 +251,11 @@ impl Daemon {
     }
 
     async fn sync_light_to_ha(&self, room: &str, st: &LightState) {
+        let Some(ha) = self.ha() else { return; };
         ha_set_state(
             &self.client,
-            &self.config.homeassistant.url,
-            &self.config.homeassistant.token,
+            &ha.url,
+            &ha.token,
             &format!("light.{}_fan_light", room),
             &st.state.to_lowercase(),
             json!({ "friendly_name": format!("{} Fan Light", title_case(room)) }),
@@ -210,6 +263,10 @@ impl Daemon {
     }
 
     async fn init_entities(&self) {
+        if self.ha().is_none() {
+            info!("Home Assistant integration disabled — skipping entity init");
+            return;
+        }
         info!("Initialising entities in Home Assistant...");
         for room in self.config.fans.keys() {
             let (fan_st, light_st) = {
@@ -230,6 +287,14 @@ impl Daemon {
             save_state(&s);
         }
         self.sync_fan_to_ha(room, &new).await;
+        if let Some(hk) = &self.homekit {
+            hk.update_fan(
+                room,
+                new.state == "ON",
+                new.percentage.min(100) as u8,
+                new.direction != "reverse",
+            ).await;
+        }
     }
 
     async fn set_light(&self, room: &str, new: LightState) {
@@ -239,6 +304,9 @@ impl Daemon {
             save_state(&s);
         }
         self.sync_light_to_ha(room, &new).await;
+        if let Some(hk) = &self.homekit {
+            hk.update_light(room, new.state == "ON").await;
+        }
     }
 
     // Maps HA percentage → fan speed index (0=fastest/speed1, 5=slowest/speed6, 6=stop).
@@ -372,7 +440,12 @@ impl Daemon {
     }
 
     async fn run(self: Arc<Self>) {
-        let ws_url = self.config.homeassistant.url
+        let Some(ha) = self.ha() else {
+            info!("Home Assistant integration disabled — daemon idle (HomeKit only)");
+            std::future::pending::<()>().await;
+            return;
+        };
+        let ws_url = ha.url
             .replace("https://", "wss://")
             .replace("http://", "ws://")
             + "/api/websocket";
@@ -395,7 +468,7 @@ impl Daemon {
                                     Some("auth_required") => {
                                         let _ = tx.send(Message::Text(json!({
                                             "type": "auth",
-                                            "access_token": self.config.homeassistant.token,
+                                            "access_token": ha.token,
                                         }).to_string())).await;
                                     }
                                     Some("auth_ok") => {
@@ -461,7 +534,7 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,hap=debug,libmdns=error")),
         )
         .init();
 
@@ -471,7 +544,50 @@ async fn main() {
     let config: Config = serde_yaml::from_str(&raw)
         .unwrap_or_else(|e| panic!("Cannot parse {}: {}", config_path, e));
 
-    let daemon = Arc::new(Daemon::new(config));
+    let mut daemon = Daemon::new(config);
+
+    // Optional HomeKit bridge
+    if let Some(hk_cfg) = daemon.config.homekit.as_ref().filter(|c| c.enabled) {
+        let rooms: Vec<String> = daemon.config.fans.keys().cloned().collect();
+        let pin_bytes = parse_pin(&hk_cfg.pin);
+        let bridge_name = hk_cfg.name.clone().unwrap_or_else(hostname);
+        match homekit::HomeKit::new(&bridge_name, &rooms, hk_cfg.port, &hk_cfg.persist_dir, pin_bytes).await {
+            Ok((hk, server)) => {
+                info!("HomeKit bridge \"{}\" on port {} (persist={})", bridge_name, hk_cfg.port, hk_cfg.persist_dir);
+                daemon.homekit = Some(hk);
+                tokio::spawn(homekit::run_server(server));
+            }
+            Err(e) => error!("HomeKit bridge failed to start: {}", e),
+        }
+    }
+
+    let daemon = Arc::new(daemon);
+
+    // If HomeKit is enabled, consume its command stream and dispatch as service calls.
+    if let Some(hk) = daemon.homekit.clone() {
+        let d = Arc::clone(&daemon);
+        tokio::spawn(async move {
+            let mut rx = match hk.cmd_rx.lock().await.take() {
+                Some(r) => r,
+                None => return,
+            };
+            while let Some(cmd) = rx.recv().await {
+                info!("HomeKit → {} {} {} {}", cmd.domain, cmd.service, cmd.room, cmd.data);
+                let entity = match cmd.domain {
+                    "fan" => format!("fan.{}_fan", cmd.room),
+                    "light" => format!("light.{}_fan_light", cmd.room),
+                    _ => continue,
+                };
+                Arc::clone(&d).handle_service(
+                    cmd.domain.to_string(),
+                    cmd.service.to_string(),
+                    vec![entity],
+                    cmd.data,
+                ).await;
+            }
+        });
+    }
+
     daemon.init_entities().await;
     Arc::clone(&daemon).run().await;
 }

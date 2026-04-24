@@ -1,4 +1,6 @@
+# Optional. Omit the section entirely or set `enabled: false` to run HomeKit-only.
 homeassistant:
+  enabled: true
   url: http://homeassistant.local:8123
   token: your_long_lived_access_token
 
@@ -11,4 +13,4 @@ fans:
 # homekit:
 #   enabled: true
 #   port: 51826
-#   persist_file: homekit.state
+#   persist_dir: homekit
