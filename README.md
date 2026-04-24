@@ -3,12 +3,36 @@ ceiling fans (remote model `TR301A`) to Home Assistant and HomeKit. The
 remote has a big SET button but no DIP switches, so we pair by sniffing
 the remote's unique 14-bit `FAN_ID` off the air and replaying it.
 
-Decoding the remote control signal and remote IDs
+Pairing a fan with an arbitrary ID
 --
 
-I had to use a RTL-SDR dongle to find out the serial number for the
-remotes. Follow [this tutorial](https://www.youtube.com/watch?v=_GCpqory3kc)
-to capture and decode the ceiling fan signal.
+Per the remote's manual, the fan learns whichever 14-bit `FAN_ID` the
+remote transmits during a pairing window:
+
+1. Remove the battery cover on the remote — there's a "Learn Switch"
+   underneath.
+2. Cut power to the ceiling fan at the breaker (or wall switch) for
+   one minute.
+3. Restore power. You have 60 seconds to pair.
+4. Press and hold the Learn Switch with a pen or paperclip until the
+   light on the fan blinks twice, then release.
+
+In principle you can do the same thing from this daemon by sending the
+`pair` command (`0100100` in the protocol table) within the pairing
+window, with whatever 14-bit `FAN_ID` you've put in `config.yaml` —
+the fan should latch onto it and ignore the original remote. **I've
+never actually tried this**; I sniffed my existing remotes instead.
+If you do try it, please open an issue and let me know whether it
+works.
+
+Decoding an existing remote's ID
+--
+
+If you'd rather mirror an existing remote than assign a new ID, use an
+RTL-SDR dongle to capture the remote's transmission and extract the
+14-bit `FAN_ID`. Follow
+[this tutorial](https://www.youtube.com/watch?v=_GCpqory3kc), or use
+`utils/decode_fan_remote.py` on a recorded capture.
 
 Sending the remote control signal
 --
@@ -53,9 +77,10 @@ cargo zigbuild --release --target arm-unknown-linux-gnueabihf
 ```
 
 Copy `config_sample.yaml` to `/etc/onlyfansd/config.yaml` on the Pi and
-fill in your HA URL + token and the RF `FAN_ID` for each fan. See the
-decoding section above. Deploy the binary to `/usr/local/bin/onlyfansd`
-and run it under systemd.
+fill in your HA URL + token and the 14-bit `FAN_ID` for each fan
+(pair it via the SET-button procedure above, or sniff an existing
+remote). Deploy the binary to `/usr/local/bin/onlyfansd` and run it
+under systemd.
 
 Integrations
 --
@@ -87,6 +112,5 @@ Debugging a fan that won't respond
 --
 
 Compare the signal this daemon sends out against what the actual remote
-sends out. Or spend some more minutes to figure out how the SET button
-works so you can send arbitrary IDs to the fans —
-[I assume that's possible](https://www.amazon.com/review/R2VWOTH0LUT4XJ/).
+sends out. If you suspect the fan lost its pairing (e.g. after a long
+power outage), re-pair it with the SET-button procedure above.
