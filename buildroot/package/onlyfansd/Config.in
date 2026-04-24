@@ -1,0 +1,9 @@
+config BR2_PACKAGE_ONLYFANSD
+	bool "onlyfansd"
+	depends on BR2_PACKAGE_HOST_RUSTC
+	select BR2_PACKAGE_HOST_CARGO
+	help
+	  Daemon that bridges Home Assistant WebSocket events to RF transmissions
+	  for controlling Casa Vieja TR301A ceiling fans via sendook/rpitx.
+
+	  Requires the sendook binary (from rpitx) to be installed separately.
