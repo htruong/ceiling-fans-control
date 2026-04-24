@@ -1,60 +1,92 @@
-This is a python daemon that exposes fan and light controls for the Casa Vieja fans to Home Assistant. The remote is called `Ceiling fan remote controller`, model is `TR301A`. The remote has a big SET button, but no DIP switches that can be configured for different fans.
+This is a daemon that exposes fan and light controls for Casa Vieja
+ceiling fans (remote model `TR301A`) to Home Assistant and HomeKit. The
+remote has a big SET button but no DIP switches, so we pair by sniffing
+the remote's unique 14-bit `FAN_ID` off the air and replaying it.
 
-Decoding the remote control signal and remote ids
+Decoding the remote control signal and remote IDs
 --
 
-I had to use a RTL-SDR dongle to find out the serial number for the remotes. Please follow [this wonderful tutorial](https://www.youtube.com/watch?v=_GCpqory3kc) to understand how to capture and decode the ceiling fan signal.
+I had to use a RTL-SDR dongle to find out the serial number for the
+remotes. Follow [this tutorial](https://www.youtube.com/watch?v=_GCpqory3kc)
+to capture and decode the ceiling fan signal.
 
 Sending the remote control signal
 --
 
-You can use a vanilla raspberry pi of any kind to transmit control signals (I used a Pi 0), using [rpitx](https://github.com/F5OEO/rpitx), at least in a hacky way, [without additional or customized hardware](https://www.youtube.com/watch?v=3lGU7PjJM7k).
+You can use a vanilla Raspberry Pi of any kind to transmit control
+signals (I used a Pi 0), using [rpitx](https://github.com/F5OEO/rpitx),
+at least in a hacky way, [without additional or customized hardware](https://www.youtube.com/watch?v=3lGU7PjJM7k).
 
-Note that this only serves as a remote control, as we don't know what the fans are actually doing: we just send commands blindly and hope it works, just like the remotes.
+This only serves as a remote control — we don't know what the fans are
+actually doing, we just send commands blindly and hope it works, like
+the remotes do.
 
 Architecture
 --
 
-The daemon (`onlyfansd.py`) runs on a Raspberry Pi and bridges Home Assistant to the physical fans:
+The daemon (Rust, in `src/`) runs on a Raspberry Pi and bridges both
+Home Assistant and HomeKit to the physical fans:
 
-1. **Startup** — the daemon calls the HA REST API to initialise virtual fan and light entities for each configured room.
-2. **Command reception** — it connects to HA over a persistent WebSocket and authenticates with a long-lived access token. It listens for `call_service` events targeting the fan/light entities.
-3. **RF transmission** — when a command arrives, it invokes `rpitx` via `control_fan.py` to transmit the corresponding RF signal on the Pi's GPIO pin, mimicking the original remote.
-4. **State updates** — after each command, it pushes the new state back to HA via the REST API so the UI reflects the change.
+1. **Startup** — loads persisted state, then (optionally) calls the
+   HA REST API to initialise virtual fan/light entities.
+2. **Command reception** — either
+   - **HA**: a persistent WebSocket authenticated with a long-lived
+     access token, listening for `call_service` events; or
+   - **HomeKit**: a native HAP bridge (via vendored `hap-rs`) that
+     iOS Home discovers via Bonjour and talks to directly.
+3. **RF transmission** — when a command arrives, it shells out to
+   `sendook` (from `rpitx`) to transmit the 25-bit OOK frame on the
+   Pi's GPIO pin, mimicking the original remote.
+4. **State updates** — after each command, state is persisted locally,
+   pushed to HA via REST, and mirrored into the HomeKit characteristics.
 
-This approach requires no external broker — the Pi talks directly to HA over WebSocket and REST.
+No external broker required. Either or both integrations can be
+disabled in the config.
 
 How to use this repository
 --
 
-Install prereqs:
+Cross-compile for the Pi (any ARMv6HF target, e.g. Pi Zero / Pi 1):
 
 ```
-sudo apt install python3-yaml
-pip3 install requests websocket-client
+cargo zigbuild --release --target arm-unknown-linux-gnueabihf
 ```
 
-Copy `config_sample.yaml` to `config.yaml` and fill in:
-- Your HA URL and a long-lived access token (Profile → Long-Lived Access Tokens in HA)
-- The RF remote ID for each fan (see the decoding section above)
+Copy `config_sample.yaml` to `/etc/onlyfansd/config.yaml` on the Pi and
+fill in your HA URL + token and the RF `FAN_ID` for each fan. See the
+decoding section above. Deploy the binary to `/usr/local/bin/onlyfansd`
+and run it under systemd.
 
-Then run the daemon:
-
-```
-python3 onlyfansd.py
-```
-
-Adding fans to Home Assistant
+Integrations
 --
 
-The daemon creates entities via the HA REST API (`/api/states/`), which means they appear in **Developer Tools → States** but are not backed by an integration — HA will not auto-add them to your dashboards.
+- **Home Assistant**: The daemon creates entities via the REST API
+  (`/api/states/`), which means they appear in **Developer Tools →
+  States** but are not backed by an integration — HA will not
+  auto-add them to your dashboards. To give them persistent
+  `unique_id`s so they're UI-manageable, drop `ceiling_fans.yaml`
+  into your HA config directory and add
+  `template: !include ceiling_fans.yaml` to `configuration.yaml`.
+- **HomeKit**: set `homekit.enabled: true` in the config. The bridge
+  is advertised via mDNS. Pair using the PIN you set in
+  `homekit.pin` (default `03141592`). Pairing data persists in
+  `homekit.persist_dir`.
 
-To make them controllable from the UI, add them manually to a Lovelace dashboard:
+Set `homeassistant.enabled: false` (or omit the whole
+`homeassistant:` section) to run HomeKit-only.
 
-1. Edit a dashboard → Add Card → Entities
-2. Add the fan entities: `fan.{room}_fan`
-3. Add the light entities: `light.{room}_fan_light`
+`utils/` — Python reference implementation
+--
 
-The states reported are best-effort (the daemon tracks what it last commanded, not what the fan is actually doing), so treat them as approximate.
+The original Python implementation and a couple of small utilities live
+in `utils/`. They are not needed at runtime; keep them around as a
+readable reference for the RF protocol, and to help bring up new fans.
+See [utils/README.md](utils/README.md) for details.
 
-If you can't control the fans, debug by comparing the signal that this daemon sends out against the actual signal the remote sends out to understand what went wrong. Or you could spend some more minutes to figure out how the SET button works, and then add a program button to the integration. I can't be bothered to figure out how the SET button works, to send arbitrary IDs we choose to the fans, but [I assume that's possible](https://www.amazon.com/review/R2VWOTH0LUT4XJ/).
+Debugging a fan that won't respond
+--
+
+Compare the signal this daemon sends out against what the actual remote
+sends out. Or spend some more minutes to figure out how the SET button
+works so you can send arbitrary IDs to the fans —
+[I assume that's possible](https://www.amazon.com/review/R2VWOTH0LUT4XJ/).
