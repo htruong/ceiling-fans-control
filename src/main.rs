@@ -1,4 +1,5 @@
 mod homekit;
+mod rpitx;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -7,8 +8,6 @@ use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::process::Stdio;
-use tokio::process::Command as ProcCommand;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -142,22 +141,33 @@ fn build_chip_stream(fan_id: &str, cmd: &str) -> Option<String> {
     Some(format!("{}{}", chips, "0".repeat(30)))
 }
 
+// 304.30 MHz, 333 µs per chip, 3 repeats with 1 ms pause — matches the
+// upstream remote and what the previous `sendook` invocation did.
+const RF_FREQ_HZ: u64 = 304_300_000;
+const RF_CHIP_US: u32 = 333;
+const RF_REPEAT: u32 = 3;
+const RF_PAUSE_US: u32 = 1_000;
+
 async fn send_rf(fan_id: &str, cmd: &str) {
     let chips = match build_chip_stream(fan_id, cmd) {
         Some(c) => c,
         None => { error!("Unknown RF command: {}", cmd); return; }
     };
-    let args = ["-f", "304300000", "-0", "333", "-1", "333", chips.as_str()];
-    info!("exec: sendook {}", args.join(" "));
-    match ProcCommand::new("sendook")
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await
-    {
-        Ok(s) => info!("sendook exit={}", s.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into())),
-        Err(e) => error!("sendook failed: {}", e),
+    info!("rpitx send_ook freq={} chips={} repeats={}", RF_FREQ_HZ, chips.len(), RF_REPEAT);
+
+    // librpitx grabs DMA channels + maps /dev/mem; running it on the tokio
+    // worker thread would block the runtime for the full transmission
+    // (~30 ms per repeat). Run on a blocking thread instead.
+    let chips_owned = chips;
+    let res = tokio::task::spawn_blocking(move || {
+        rpitx::send_ook(RF_FREQ_HZ, &chips_owned, RF_CHIP_US, RF_REPEAT, RF_PAUSE_US)
+    })
+    .await;
+
+    match res {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => error!("rpitx send_ook failed: {}", e),
+        Err(e) => error!("rpitx send_ook task panicked: {}", e),
     }
 }
 
