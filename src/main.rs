@@ -46,11 +46,23 @@ struct HomeKitConfig {
     pin: String,  // 8 digits, e.g. "03141592"
     #[serde(default)]
     name: Option<String>,
+    // Address the HAP TCP listener binds to. Default 0.0.0.0 listens on
+    // every interface, which is what most embedded HAP bridges do — pin
+    // it to a specific NIC IP only if you've got a multi-homed host and
+    // need to constrain which network can see the accessory. Defaulting
+    // to 0.0.0.0 also avoids the boot race where hap-rs's
+    // `redetermine_local_ip()` runs before DHCP completes, finds only
+    // loopback, and persists `"host":"127.0.0.1"` into the config —
+    // after which the HAP listener is unreachable from the LAN and
+    // every iOS pairing attempt times out.
+    #[serde(default = "default_hk_bind")]
+    bind: String,
 }
 
 fn default_hk_port() -> u16 { 51826 }
 fn default_hk_persist() -> String { "homekit".into() }
 fn default_hk_pin() -> String { "03141592".into() }
+fn default_hk_bind() -> String { "0.0.0.0".into() }
 
 fn hostname() -> String {
     std::fs::read_to_string("/etc/hostname")
@@ -565,9 +577,11 @@ async fn main() {
         let rooms: Vec<String> = daemon.config.fans.keys().cloned().collect();
         let pin_bytes = parse_pin(&hk_cfg.pin);
         let bridge_name = hk_cfg.name.clone().unwrap_or_else(hostname);
-        match homekit::HomeKit::new(&bridge_name, &rooms, hk_cfg.port, &hk_cfg.persist_dir, pin_bytes).await {
+        let bind_ip: std::net::IpAddr = hk_cfg.bind.parse()
+            .unwrap_or_else(|e| panic!("invalid homekit.bind \"{}\": {}", hk_cfg.bind, e));
+        match homekit::HomeKit::new(&bridge_name, &rooms, bind_ip, hk_cfg.port, &hk_cfg.persist_dir, pin_bytes).await {
             Ok((hk, server)) => {
-                info!("HomeKit bridge \"{}\" on port {} (persist={})", bridge_name, hk_cfg.port, hk_cfg.persist_dir);
+                info!("HomeKit bridge \"{}\" on {}:{} (persist={})", bridge_name, bind_ip, hk_cfg.port, hk_cfg.persist_dir);
                 daemon.homekit = Some(hk);
                 tokio::spawn(homekit::run_server(server));
             }

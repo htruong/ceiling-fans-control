@@ -15,8 +15,12 @@ fans:
 # Optional: expose fans directly to HomeKit.
 # Persistent pairing state is kept in `persist_dir`.
 # Bridge name defaults to the machine's hostname if omitted.
+# `bind` defaults to 0.0.0.0 (listen on every interface); pin it to a
+# specific NIC IP only if you've got a multi-homed host that needs to
+# constrain which network can see the accessory.
 # homekit:
 #   enabled: true
+#   bind: 0.0.0.0
 #   port: 51826
 #   pin: '03141592'
 #   persist_dir: /var/lib/onlyfansd/homekit

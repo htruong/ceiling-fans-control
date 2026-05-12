@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -44,7 +45,12 @@ pub struct HomeKit {
 impl HomeKit {
     /// Initialise the HomeKit bridge. Registers one CeilingFan accessory per room.
     /// Does NOT start the server — call [`run`] afterwards to drive it.
-    pub async fn new(bridge_name: &str, rooms: &[String], port: u16, persist_dir: &str, pin: [u8; 8]) -> hap::Result<(Arc<Self>, IpServer)> {
+    ///
+    /// `bind` is the address the HAP TCP listener binds to. Pass `0.0.0.0` to
+    /// listen on every interface (recommended — see HomeKitConfig::bind in
+    /// main.rs for why hap-rs's default `redetermine_local_ip()` path is
+    /// unreliable on systems where DHCP completes after this daemon starts).
+    pub async fn new(bridge_name: &str, rooms: &[String], bind: IpAddr, port: u16, persist_dir: &str, pin: [u8; 8]) -> hap::Result<(Arc<Self>, IpServer)> {
         let (cmd_tx, cmd_rx) = mpsc::channel::<HkCommand>(32);
         let suppress: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
@@ -74,25 +80,25 @@ impl HomeKit {
         std::fs::create_dir_all(persist_dir).ok();
         let mut storage = FileStorage::new(&PathBuf::from(persist_dir)).await?;
 
-        let config = match storage.load_config().await {
-            Ok(mut c) => {
-                c.redetermine_local_ip();
-                storage.save_config(&c).await?;
-                c
-            }
-            Err(_) => {
-                let c = HapConfig {
-                    pin: Pin::new(pin)?,
-                    name: bridge_name.into(),
-                    device_id: random_mac(),
-                    category: AccessoryCategory::Bridge,
-                    port,
-                    ..Default::default()
-                };
-                storage.save_config(&c).await?;
-                c
-            }
+        // Force the listen address from the caller (config). hap-rs's
+        // own `redetermine_local_ip()` walks if_addrs and falls back to
+        // 127.0.0.1 when no non-loopback interface is up yet — which
+        // happens at boot if this daemon races wlan0's DHCP. Once the
+        // bad value lands in config.json, it sticks. Setting host on
+        // every start makes the persisted value advisory only.
+        let mut config = match storage.load_config().await {
+            Ok(c) => c,
+            Err(_) => HapConfig {
+                pin: Pin::new(pin)?,
+                name: bridge_name.into(),
+                device_id: random_mac(),
+                category: AccessoryCategory::Bridge,
+                port,
+                ..Default::default()
+            },
         };
+        config.host = bind;
+        storage.save_config(&config).await?;
 
         let server = IpServer::new(config, storage).await?;
         let bridge_ptr = server.add_accessory(bridge).await?;
