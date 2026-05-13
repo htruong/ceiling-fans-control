@@ -1,8 +1,8 @@
 mod homekit;
-mod rpitx;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
@@ -17,8 +17,8 @@ use tracing::{error, info, warn};
 
 #[derive(Deserialize)]
 struct Config {
-    #[serde(default)]
-    homeassistant: Option<HaConfig>,
+    homeassistant: HaConfig,
+    esphome: EspHomeConfig,
     fans: HashMap<String, String>, // room → 14-bit fan ID string
     #[serde(default)]
     homekit: Option<HomeKitConfig>,
@@ -26,13 +26,62 @@ struct Config {
 
 #[derive(Deserialize)]
 struct HaConfig {
-    #[serde(default = "default_true")]
-    enabled: bool,
     url: String,
     token: String,
+    // Whether to subscribe to HA's WebSocket for `call_service` events and
+    // mirror entity state back to HA via REST. The outbound RF path
+    // (HA → ESPHome) always uses the REST API regardless of this setting.
+    #[serde(default = "default_true")]
+    listen: bool,
+}
+
+#[derive(Deserialize)]
+struct EspHomeConfig {
+    // ESPHome device name (underscored form). Used as the HA service
+    // suffix on the ha_rest transport.
+    device: String,
+    // Retransmissions per command. The physical remote sends 3–5;
+    // 4 is a fine default.
+    #[serde(default = "default_repeat")]
+    repeat: u32,
+    // How the daemon delivers the RF frame to the ESPHome bridge:
+    //   ha_rest (default) — POST to HA's REST API, which proxies the
+    //     `transmit_fan_bits` action over HA's native ESPHome link.
+    //   http              — POST directly to the ESPHome device's
+    //     web_server REST endpoint. Bypasses HA entirely; useful if HA
+    //     reliability is a concern. Requires the matching `http:` block.
+    #[serde(default = "default_transport")]
+    transport: Transport,
+    #[serde(default)]
+    http: Option<EspHomeHttpConfig>,
+}
+
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum Transport {
+    HaRest,
+    Http,
+}
+
+#[derive(Deserialize)]
+struct EspHomeHttpConfig {
+    // Hostname or IP of the ESPHome device. e.g. "fan-remote1.local"
+    // or "192.168.2.217".
+    host: String,
+    #[serde(default = "default_http_port")]
+    port: u16,
+    // HTTP Basic auth for /text/rf_tx/set — match web_server.auth in
+    // fan-remote.yaml. Omit both if you left web_server.auth unset.
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
 }
 
 fn default_true() -> bool { true }
+fn default_repeat() -> u32 { 4 }
+fn default_transport() -> Transport { Transport::HaRest }
+fn default_http_port() -> u16 { 80 }
 
 #[derive(Deserialize)]
 struct HomeKitConfig {
@@ -130,8 +179,9 @@ impl SharedState {
 
 // ── RF Protocol ───────────────────────────────────────────────────────────────
 
-// 304.30 MHz OOK, 333 µs per chip. Each bit → 3 chips '10b'.
-// Message = preamble(4) + FAN_ID(14) + cmdid(7) = 25 bits = 75 chips + 30-chip pause.
+// 7-bit cmdid vocabulary — same for every fan. See protocol.txt.
+// The physical-layer encoding (chips, pulse timing, 304.30 MHz OOK) lives
+// in the ESPHome firmware; the daemon only assembles the 25-bit message.
 const CMDS: &[(&str, &str)] = &[
     ("reverse", "0001000"),
     ("light",   "0000010"),
@@ -144,44 +194,6 @@ const CMDS: &[(&str, &str)] = &[
     ("speed6",  "1000000"),
     ("pair",    "0100100"),
 ];
-
-fn build_chip_stream(fan_id: &str, cmd: &str) -> Option<String> {
-    assert_eq!(fan_id.len(), 14, "FAN_ID must be 14 bits, got {}", fan_id.len());
-    let cmd_bits = CMDS.iter().find(|(k, _)| *k == cmd)?.1;
-    let bits = format!("1111{}{}", fan_id, cmd_bits);
-    let chips: String = bits.chars().map(|b| format!("10{}", b)).collect();
-    Some(format!("{}{}", chips, "0".repeat(30)))
-}
-
-// 304.30 MHz, 333 µs per chip, 3 repeats with 1 ms pause — matches the
-// upstream remote and what the previous `sendook` invocation did.
-const RF_FREQ_HZ: u64 = 304_300_000;
-const RF_CHIP_US: u32 = 333;
-const RF_REPEAT: u32 = 3;
-const RF_PAUSE_US: u32 = 1_000;
-
-async fn send_rf(fan_id: &str, cmd: &str) {
-    let chips = match build_chip_stream(fan_id, cmd) {
-        Some(c) => c,
-        None => { error!("Unknown RF command: {}", cmd); return; }
-    };
-    info!("rpitx send_ook freq={} chips={} repeats={}", RF_FREQ_HZ, chips.len(), RF_REPEAT);
-
-    // librpitx grabs DMA channels + maps /dev/mem; running it on the tokio
-    // worker thread would block the runtime for the full transmission
-    // (~30 ms per repeat). Run on a blocking thread instead.
-    let chips_owned = chips;
-    let res = tokio::task::spawn_blocking(move || {
-        rpitx::send_ook(RF_FREQ_HZ, &chips_owned, RF_CHIP_US, RF_REPEAT, RF_PAUSE_US)
-    })
-    .await;
-
-    match res {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => error!("rpitx send_ook failed: {}", e),
-        Err(e) => error!("rpitx send_ook task panicked: {}", e),
-    }
-}
 
 // ── Persistence ───────────────────────────────────────────────────────────────
 
@@ -238,6 +250,10 @@ struct Daemon {
     client: Client,
     state: Mutex<SharedState>,
     homekit: Option<Arc<homekit::HomeKit>>,
+    // Monotonic counter appended to HTTP-transport payloads so two
+    // consecutive identical commands (e.g. light, light) don't get
+    // deduped by ESPHome's text entity. Unused for the ha_rest path.
+    nonce: AtomicU64,
 }
 
 impl Daemon {
@@ -247,16 +263,96 @@ impl Daemon {
         let mut state = SharedState::new();
         state.fan_states = persisted.fans;
         state.light_states = persisted.lights;
-        Self { config, client: Client::new(), state: Mutex::new(state), homekit: None }
+        Self {
+            config,
+            client: Client::new(),
+            state: Mutex::new(state),
+            homekit: None,
+            nonce: AtomicU64::new(0),
+        }
     }
 
-    /// Returns the HA config only when it's present AND enabled.
-    fn ha(&self) -> Option<&HaConfig> {
-        self.config.homeassistant.as_ref().filter(|h| h.enabled)
+    /// Send an RF command. Dispatches to either HA's REST API (which then
+    /// proxies to ESPHome) or directly to the ESPHome device's web_server,
+    /// depending on `esphome.transport`.
+    async fn send_rf(&self, fan_id: &str, cmd: &str) {
+        let cmdid = match CMDS.iter().find(|(k, _)| *k == cmd) {
+            Some((_, v)) => *v,
+            None => { error!("Unknown RF command: {}", cmd); return; }
+        };
+        assert_eq!(fan_id.len(), 14, "FAN_ID must be 14 bits, got {}", fan_id.len());
+        let bits = format!("1111{}{}", fan_id, cmdid);
+        debug_assert_eq!(bits.len(), 25);
+
+        info!(
+            "RF → {} {} (bits={}, repeat={}, transport={:?})",
+            fan_id, cmd, bits, self.config.esphome.repeat, self.config.esphome.transport,
+        );
+
+        match self.config.esphome.transport {
+            Transport::HaRest => self.send_rf_ha_rest(fan_id, cmd, &bits).await,
+            Transport::Http   => self.send_rf_http(fan_id, cmd, &bits).await,
+        }
+    }
+
+    async fn send_rf_ha_rest(&self, fan_id: &str, cmd: &str, bits: &str) {
+        let ha = &self.config.homeassistant;
+        let endpoint = format!(
+            "{}/api/services/esphome/{}_transmit_fan_bits",
+            ha.url, self.config.esphome.device,
+        );
+        match self.client.post(&endpoint)
+            .header("Authorization", format!("Bearer {}", ha.token))
+            .json(&json!({ "bits": bits, "repeat": self.config.esphome.repeat }))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => {}
+            Ok(r) => error!("RF {} {} → HTTP {}", fan_id, cmd, r.status()),
+            Err(e) => error!("RF {} {} failed: {}", fan_id, cmd, e),
+        }
+    }
+
+    async fn send_rf_http(&self, fan_id: &str, cmd: &str, bits: &str) {
+        let http = match &self.config.esphome.http {
+            Some(h) => h,
+            None => {
+                error!("esphome.transport=http but no esphome.http config block");
+                return;
+            }
+        };
+        // <bits>:<repeat>:<nonce> — see the on_value lambda in fan-remote.yaml.
+        // The third field is consumed by atoi() up to the next non-digit, so
+        // we can chain values; we only need a unique tail to force re-fire.
+        // Modulo keeps the URL short (5 digits max) — long URLs have
+        // tripped ESPHome's IDF web_server in testing.
+        let nonce = self.nonce.fetch_add(1, Ordering::Relaxed) % 100_000;
+        let value = format!("{}:{}:{}", bits, self.config.esphome.repeat, nonce);
+        let url = format!("http://{}:{}/text/rf_tx/set", http.host, http.port);
+
+        let mut req = self.client.post(&url)
+            .query(&[("value", value.as_str())])
+            // ESPHome's IDF web_server needs Content-Length AND a
+            // Content-Type for POSTs — without the latter, query-string
+            // parameters can be ignored and the TextCall arrives empty.
+            .header(reqwest::header::CONTENT_LENGTH, "0")
+            .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .timeout(Duration::from_secs(5));
+        if let Some(user) = &http.username {
+            req = req.basic_auth(user, http.password.as_deref());
+        }
+
+        match req.send().await {
+            Ok(r) if r.status().is_success() => {}
+            Ok(r) => error!("RF {} {} → HTTP {}", fan_id, cmd, r.status()),
+            Err(e) => error!("RF {} {} failed: {}", fan_id, cmd, e),
+        }
     }
 
     async fn sync_fan_to_ha(&self, room: &str, st: &FanState) {
-        let Some(ha) = self.ha() else { return; };
+        if !self.config.homeassistant.listen { return; }
+        let ha = &self.config.homeassistant;
         ha_set_state(
             &self.client,
             &ha.url,
@@ -273,7 +369,8 @@ impl Daemon {
     }
 
     async fn sync_light_to_ha(&self, room: &str, st: &LightState) {
-        let Some(ha) = self.ha() else { return; };
+        if !self.config.homeassistant.listen { return; }
+        let ha = &self.config.homeassistant;
         ha_set_state(
             &self.client,
             &ha.url,
@@ -285,8 +382,8 @@ impl Daemon {
     }
 
     async fn init_entities(&self) {
-        if self.ha().is_none() {
-            info!("Home Assistant integration disabled — skipping entity init");
+        if !self.config.homeassistant.listen {
+            info!("homeassistant.listen=false — skipping entity init");
             return;
         }
         info!("Initialising entities in Home Assistant...");
@@ -348,13 +445,13 @@ impl Daemon {
         };
         let snapped = Self::speed_snap(percentage);
         if snapped >= 6 {
-            send_rf(&fan_id, "stop").await;
+            self.send_rf(&fan_id, "stop").await;
             self.set_fan(room, FanState { state: "OFF".into(), percentage: 0, direction }).await;
         } else {
             let speed = format!("speed{}", snapped + 1);
             let snapped_pct = (100.0 - snapped as f64 * 100.0 / 6.0).round() as u32;
             info!("{} → {} ({}%)", room, speed, snapped_pct);
-            send_rf(&fan_id, &speed).await;
+            self.send_rf(&fan_id, &speed).await;
             self.set_fan(room, FanState { state: "ON".into(), percentage: snapped_pct, direction }).await;
         }
     }
@@ -421,7 +518,7 @@ impl Daemon {
                     }
                     "set_direction" => {
                         if let Some(fan_id) = self.config.fans.get(&room).cloned() {
-                            send_rf(&fan_id, "reverse").await;
+                            self.send_rf(&fan_id, "reverse").await;
                         }
                         let dir = service_data["direction"]
                             .as_str()
@@ -444,7 +541,7 @@ impl Daemon {
                 info!("light {} {}", room, service);
                 if matches!(service.as_str(), "turn_on" | "turn_off" | "toggle") {
                     if let Some(fan_id) = self.config.fans.get(&room).cloned() {
-                        send_rf(&fan_id, "light").await;
+                        self.send_rf(&fan_id, "light").await;
                     }
                     let current_on = self.state.lock().await
                         .light_states.get(&room)
@@ -462,11 +559,12 @@ impl Daemon {
     }
 
     async fn run(self: Arc<Self>) {
-        let Some(ha) = self.ha() else {
-            info!("Home Assistant integration disabled — daemon idle (HomeKit only)");
+        if !self.config.homeassistant.listen {
+            info!("homeassistant.listen=false — daemon idle (HomeKit-only, RF passthrough via REST)");
             std::future::pending::<()>().await;
             return;
-        };
+        }
+        let ha = &self.config.homeassistant;
         let ws_url = ha.url
             .replace("https://", "wss://")
             .replace("http://", "ws://")
@@ -569,6 +667,10 @@ async fn main() {
         .unwrap_or_else(|e| panic!("Cannot read {}: {}", config_path, e));
     let config: Config = serde_yaml::from_str(&raw)
         .unwrap_or_else(|e| panic!("Cannot parse {}: {}", config_path, e));
+
+    if config.esphome.transport == Transport::Http && config.esphome.http.is_none() {
+        panic!("esphome.transport=http requires an esphome.http: {{ host, ... }} block");
+    }
 
     let mut daemon = Daemon::new(config);
 

@@ -2,15 +2,10 @@
 name = "onlyfansd"
 version = "0.1.0"
 edition = "2021"
-# build.rs compiles rpitx-shim/shim.cpp and links librpitx.
-build = "build.rs"
 
 [[bin]]
 name = "onlyfansd"
 path = "src/main.rs"
-
-[build-dependencies]
-cc = "1"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -26,6 +21,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 hap = { path = "vendor/hap-rs" }
 
 [profile.release]
-opt-level = "z"   # optimise for size on the Pi
+opt-level = "z"
 lto = true
 strip = true

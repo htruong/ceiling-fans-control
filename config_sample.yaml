@@ -1,8 +1,35 @@
-# Optional. Omit the section entirely or set `enabled: false` to run HomeKit-only.
+# Home Assistant — required. The daemon uses HA's REST API to drive the
+# ESPHome RF bridge (see `esphome:` below), and optionally listens on HA's
+# WebSocket for inbound `call_service` events on fan/light entities.
 homeassistant:
-  enabled: true
   url: http://homeassistant.local:8123
   token: your_long_lived_access_token
+  # If true (default), subscribe to HA's WebSocket for service calls and
+  # mirror entity state back to HA via REST. Set to false for a
+  # HomeKit-only deployment that still uses HA REST as a proxy to ESPHome.
+  listen: true
+
+# ESPHome RF bridge — required. The daemon assembles a 25-bit OOK frame
+# (preamble + fan_id + cmdid) and ships it to the ESPHome node.
+esphome:
+  device: fan_remote1   # ESPHome `name:` (underscored form). Used as the
+                        # HA service suffix on the ha_rest transport.
+  repeat: 4             # retransmits per command (physical remote does 3-5)
+
+  # Transport: how the daemon delivers the frame.
+  #   ha_rest  (default) — POST to HA's REST API; HA proxies the
+  #                        `transmit_fan_bits` action over its native link.
+  #   http               — POST directly to the ESPHome web_server on the
+  #                        device. Bypasses HA entirely. Survives HA
+  #                        outages but needs the `http:` block below.
+  transport: ha_rest
+
+  # Required only when transport: http.
+  # http:
+  #   host: fan-remote1.local      # or an IP
+  #   port: 80                     # default 80
+  #   username: !secret web_user   # match web_server.auth in fan-remote.yaml
+  #   password: !secret web_pass   # omit both if web_server.auth is unset
 
 # 14-bit FAN_IDs (as strings of '0'/'1'). Sniff them off the remote with
 # decode_fan_remote.py, or pair arbitrary IDs using the fan's SET button —
