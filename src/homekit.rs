@@ -58,6 +58,12 @@ impl HomeKit {
             name: bridge_name.into(),
             manufacturer: "onlyfansd".into(),
             model: "Bridge".into(),
+            // hap-rs's Default::default() puts "undefined" here; iOS Home
+            // dedups accessories that share a (manufacturer, model,
+            // serial_number) tuple, so a bridge with N fans where every
+            // accessory has serial="undefined" silently collapses into
+            // one tile. Give each accessory a unique serial.
+            serial_number: format!("onlyfansd-bridge-{}", bridge_name),
             ..Default::default()
         })?;
 
@@ -70,6 +76,7 @@ impl HomeKit {
                 name: display,
                 manufacturer: "onlyfansd".into(),
                 model: "Casa Vieja TR301A".into(),
+                serial_number: format!("onlyfansd-fan-{}", room),
                 ..Default::default()
             })?;
             wire_callbacks(&mut acc, room.clone(), cmd_tx.clone(), Arc::clone(&suppress));
