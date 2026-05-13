@@ -3,14 +3,15 @@ Home Assistant via an ESP32 + CC1101 RF radio. The remote has a big SET
 button but no DIP switches, so we pair by sniffing the remote's unique
 14-bit `FAN_ID` off the air and replaying it.
 
-Two implementations live in this repo. Pick one:
+Two pieces, use either or both:
 
-1. **ESPHome + CC1101 + HA** (recommended). One ESP32-based RF node;
-   all per-fan logic lives in Home Assistant; no firmware reflash to
-   experiment. See below.
-2. **Rust daemon on a Pi (legacy)**. Single Pi running `rpitx`/`sendook`
-   on a GPIO pin; daemon bridges HA + native HomeKit. See [Legacy: Rust
-   daemon on a Pi](#legacy-rust-daemon-on-a-pi) at the bottom.
+1. **ESPHome + CC1101 + HA** (the RF bridge — required). One
+   ESP32-based RF node; all per-fan logic lives in Home Assistant;
+   no firmware reflash to experiment. See below.
+2. **`onlyfansd`** (Rust, optional). A small daemon that adds a native
+   HomeKit bridge and HA entity init on top of #1. It sends RF through
+   the same ESPHome path via HA REST. See [Optional: onlyfansd](#optional-onlyfansd-homekit-bridge-daemon)
+   at the bottom.
 
 Architecture (ESPHome path)
 --
@@ -85,7 +86,22 @@ Flash the firmware
 Sending a fan command
 --
 
-From a shell:
+`fan-remote.yaml` accepts the same RF payload over two transports
+simultaneously — they both run through one shared encoder script, so
+behaviour is identical, you just pick the wire format that suits the
+caller.
+
+**Transport A: HA-native action** (HA must be in the loop)
+
+```yaml
+# HA automation / Developer Tools → Actions
+service: esphome.fan_remote1_transmit_fan_bits
+data:
+  bits: "1111010111111010000000010"   # 4 preamble + 14 fan_id + 7 cmdid
+  repeat: 4
+```
+
+Or from a shell via HA REST:
 
 ```
 utils/ha_send.sh parents_room light
@@ -93,14 +109,33 @@ utils/ha_send.sh living_room speed3 6       # repeat 6 times
 HA_URL=http://10.0.0.5:8123 utils/ha_send.sh upstairs stop
 ```
 
-From an HA automation:
+**Transport B: plain HTTP** (bypasses HA — works even if HA is down)
 
-```yaml
-service: esphome.fan_remote1_transmit_fan_bits
-data:
-  bits: "1111010111111010000000010"   # 4 preamble + 14 fan_id + 7 cmdid
-  repeat: 4
+The ESPHome `web_server` exposes a `text` entity named `rf_tx`.
+POSTing to `/text/rf_tx/set` with `value=<bits>[:<repeat>[:<nonce>]]`
+fires the same encoder. `web_server.auth` is on; supply HTTP Basic
+credentials from `secrets.yaml`.
+
+From a shell, the analogue to `ha_send.sh` (already auto-appends a
+nanosecond nonce so back-to-back identical commands don't get
+deduped):
+
 ```
+ESPHOME_USER=admin ESPHOME_PASS=secret \
+  utils/esphome_send.sh parents_room light
+ESPHOME_HOST=192.168.2.217 utils/esphome_send.sh living_room speed3 6
+```
+
+Or hand-rolled:
+
+```
+curl -u "$WEB_USER:$WEB_PASS" -X POST \
+  --data-urlencode "value=1111010111111010000000010:4:$(date +%s%N)" \
+  http://fan-remote1.local/text/rf_tx/set
+```
+
+The encoder is bit-length agnostic, so other fans / OOK protocols can
+ride the same firmware: pass any `'0'/'1'` string.
 
 Receiving a remote press
 --
@@ -161,9 +196,11 @@ utils/
   generate_esphome_config.py    Regenerates the binary_sensor block in
                                 fan-remote.yaml from config.yaml.
                                 Flags: --fan <room>, --no-header.
-  ha_send.sh                    Shell wrapper to call
-                                esphome.fan_remote1_transmit_fan_bits
-                                via the HA REST API.
+  ha_send.sh                    Shell wrapper that goes via HA REST →
+                                esphome.fan_remote1_transmit_fan_bits.
+  esphome_send.sh               Shell wrapper that goes directly to the
+                                ESPHome web_server at /text/rf_tx/set,
+                                bypassing HA.
   config.yaml                   14-bit FAN_IDs per room. Source of truth
                                 for the generator and the legacy Rust
                                 daemon.
@@ -204,33 +241,68 @@ I press a remote button once but HA toggles three times:
   precisely to prevent this — confirm it's present in
   `fan-remote.yaml`. The remote sends each press 3-5 times.
 
-Legacy: Rust daemon on a Pi
+Optional: onlyfansd (HomeKit bridge daemon)
 --
 
-The original implementation runs as a Rust daemon on a Raspberry Pi
-(any model with GPIO; I used a Pi 0) and uses
-[rpitx](https://github.com/F5OEO/rpitx)'s `sendook` to transmit OOK
-straight off a GPIO pin
-([no external hardware needed](https://www.youtube.com/watch?v=3lGU7PjJM7k)).
+`onlyfansd` (Rust, in `src/`) is an optional layer on top of the
+ESPHome+HA setup. It adds:
+
+- A native **HomeKit** bridge (vendored `hap-rs`) so iOS Home can
+  control the fans directly via HAP, without going through HA.
+- HA entity initialisation (creates `fan.<room>_fan` and
+  `light.<room>_fan_light` states via REST so HA dashboards see them
+  without needing the `ceiling_fans.yaml` template include).
+- Speed snapping (HA's 0–100 % → 6 discrete speeds) and a 1.5 s
+  debounce on speed changes so sliding the HA slider doesn't fire
+  six RF transmissions.
+- Persisted state in `fan_state.json` across restarts.
+
+It no longer transmits RF directly — all sends ride the ESPHome bridge.
+The daemon picks one of two transports via `esphome.transport`:
+
+| transport | path                                                | when to use                                            |
+| --------- | --------------------------------------------------- | ------------------------------------------------------ |
+| `ha_rest` | daemon → HA REST → ESPHome native API               | default; HA logs every TX in the event bus             |
+| `http`    | daemon → ESPHome web_server `/text/rf_tx/set`       | bypasses HA — HomeKit keeps working if HA is down      |
 
 ```
-HA WebSocket  ─┐
-               ├─►  onlyfansd (Rust)  ─►  sendook  ─►  Pi GPIO
-HomeKit (HAP) ─┘    src/main.rs                       (304.30 MHz)
+                                ha_rest:
+                              ┌─────────────────► Home Assistant ─────┐
+HA WebSocket  ─┐              │                                       ▼
+               ├─►  onlyfansd ┤                                   fan-remote1
+HomeKit (HAP) ─┘              │   http (direct, with HA bypassed):    ▲
+                              └───────────────────────────────────────┘
 ```
 
-Build & deploy:
+Either transport reaches the same `do_transmit` script on the device.
+For `http`, the daemon appends a monotonic nonce to defeat any
+same-value dedup on the ESPHome `text` entity. Config:
+
+```yaml
+esphome:
+  device: fan_remote1
+  repeat: 4
+  transport: http        # or ha_rest (default)
+  http:                  # required when transport: http
+    host: fan-remote1.local
+    port: 80
+    username: !secret web_user
+    password: !secret web_pass
+```
+
+Build & deploy (pure Rust, no native deps):
 
 ```
-cargo zigbuild --release --target arm-unknown-linux-gnueabihf
-# copy target/.../onlyfansd to /usr/local/bin/, config to /etc/onlyfansd/config.yaml,
+cargo build --release
+# or for a Pi: cargo zigbuild --release --target arm-unknown-linux-gnueabihf
+# copy target/.../onlyfansd to /usr/local/bin/onlyfansd
+# copy config to /etc/onlyfansd/config.yaml (template: config_sample.yaml)
 # run under systemd.
 ```
 
-The daemon also exposes a native HomeKit bridge (via vendored `hap-rs`)
-for clients that prefer HAP over HA. Set `homeassistant.enabled: false`
-to run HomeKit-only. See `src/`, `config_sample.yaml`, and
-`ceiling_fans.yaml`.
+Set `homeassistant.listen: false` in the config for a HomeKit-only
+deployment (no WS subscription, no entity-state mirroring to HA).
+Pair this with `esphome.transport: http` for the most HA-independent
+setup the daemon supports.
 
-This path predates the new RF/CC1101 support in HA + ESPHome and is
-kept for setups that already work.
+See `src/main.rs`, `config_sample.yaml`, and `ceiling_fans.yaml`.
