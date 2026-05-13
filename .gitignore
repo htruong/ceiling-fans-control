@@ -5,3 +5,8 @@
 /homekit/
 __pycache__/
 *.pyc
+
+# ESPHome / utils
+/utils/config.yaml
+/secrets.yaml
+.esphome/
