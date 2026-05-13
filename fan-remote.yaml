@@ -21,52 +21,96 @@ esp32:
 logger:
   level: DEBUG
 
-# Enable Home Assistant API
+# Shared transmit script — invoked by both the HA-native action and the
+# HTTP/text entity below. Keeps the OOK encoder in one place. The script
+# is bit-length agnostic: it encodes whatever '0'/'1' string it gets, so
+# fans with different protocols (longer/shorter frames) work with no
+# firmware change.
+script:
+  - id: do_transmit
+    parameters:
+      bits: string   # any '0'/'1' string. For Casa Vieja TR301A this is
+                     # "1111" + fan_id(14) + cmdid(7) = 25 chars, but the
+                     # encoder doesn't care.
+      repeat: int    # retransmits per call (real remote sends 3-5)
+    then:
+      - repeat:
+          count: !lambda "return repeat;"
+          then:
+            - remote_transmitter.transmit_raw:
+                code: !lambda |-
+                  // Encode each bit b -> chips "10b", then RLE-compress
+                  // consecutive same chips into +/- microsecond pulses.
+                  const int CHIP_US = 333;
+                  std::string chips;
+                  chips.reserve(bits.size() * 3);
+                  for (char b : bits) {
+                    chips += '1';
+                    chips += '0';
+                    chips += b;
+                  }
+                  std::vector<int32_t> pulses;
+                  size_t i = 0;
+                  while (i < chips.size()) {
+                    char level = chips[i];
+                    size_t run = 1;
+                    while (i + run < chips.size() && chips[i + run] == level) run++;
+                    int32_t dur = (int32_t)(run * CHIP_US);
+                    pulses.push_back(level == '1' ? dur : -dur);
+                    i += run;
+                  }
+                  // Drop trailing LOW so the inter-burst pause below isn't
+                  // doubled with the message's tail silence.
+                  while (!pulses.empty() && pulses.back() < 0) pulses.pop_back();
+                  return pulses;
+            # ~10ms inter-burst pause (matches the real remote's cadence)
+            - delay: 10ms
+
+# Transport #1: Home Assistant native API.
+# Call as: action esphome.fan_remote1_transmit_fan_bits
 api:
   encryption:
     key: !secret api_encryption_key
-
-  # Custom action callable from HA as service:
-  #   esphome.fan_remote_transmit_fan_bits
-  # Sends an arbitrary 25-bit OOK frame (preamble + fan_id + cmdid) via CC1101.
-  # All fan-specific knowledge lives in HA — this firmware is a dumb transmitter.
   actions:
     - action: transmit_fan_bits
       variables:
-        bits: string   # 25-char string of '0'/'1', e.g. "1111" + fan_id(14) + cmdid(7)
-        repeat: int    # how many times to retransmit (real remote sends 3-5)
+        bits: string
+        repeat: int
       then:
-        - repeat:
-            count: !lambda "return repeat;"
+        - script.execute:
+            id: do_transmit
+            bits: !lambda "return bits;"
+            repeat: !lambda "return repeat;"
+
+# Transport #2: plain HTTP via web_server.
+# Call as: POST http://fan-remote1.local/text/rf_tx/set?value=<bits>[:<repeat>]
+# E.g.:    POST .../set?value=1111010111111010000000010:4
+# A trailing ":<n>" sets repeat; default is 4.
+text:
+  - platform: template
+    # No space so the new web_server URL form (which uses the entity name,
+    # not the object_id) doesn't need URL-encoding: /text/rf_tx/set.
+    name: rf_tx
+    id: rf_tx
+    mode: text
+    optimistic: true
+    min_length: 1
+    max_length: 255
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: "return !x.empty();"
             then:
-              - remote_transmitter.transmit_raw:
-                  code: !lambda |-
-                    // Encode each bit b -> chips "10b", then RLE-compress
-                    // consecutive same chips into +/- microsecond pulses.
-                    const int CHIP_US = 333;
-                    std::string chips;
-                    chips.reserve(bits.size() * 3);
-                    for (char b : bits) {
-                      chips += '1';
-                      chips += '0';
-                      chips += b;
-                    }
-                    std::vector<int32_t> pulses;
-                    size_t i = 0;
-                    while (i < chips.size()) {
-                      char level = chips[i];
-                      size_t run = 1;
-                      while (i + run < chips.size() && chips[i + run] == level) run++;
-                      int32_t dur = (int32_t)(run * CHIP_US);
-                      pulses.push_back(level == '1' ? dur : -dur);
-                      i += run;
-                    }
-                    // Drop trailing LOW so the inter-burst pause below isn't
-                    // doubled with the message's tail silence.
-                    while (!pulses.empty() && pulses.back() < 0) pulses.pop_back();
-                    return pulses;
-              # ~10ms inter-burst pause (matches the real remote's cadence)
-              - delay: 10ms
+              - script.execute:
+                  id: do_transmit
+                  bits: !lambda |-
+                    auto colon = x.find(':');
+                    return colon == std::string::npos ? x : x.substr(0, colon);
+                  repeat: !lambda |-
+                    auto colon = x.find(':');
+                    if (colon == std::string::npos) return 4;
+                    return atoi(x.substr(colon + 1).c_str());
 
 ota:
   - platform: esphome
@@ -83,7 +127,19 @@ wifi:
 
 captive_portal:
 
+# Use spare ESP32 BT radio as a Bluetooth proxy for HA — forwards nearby
+# BLE devices (e.g. xiaomi temp sensors, plant monitors) over WiFi.
+esp32_ble_tracker:
+
+bluetooth_proxy:
+  active: true   # let HA initiate connections (not just passive scanning)
+
 web_server:
+  # Basic auth so anyone on the LAN can't toggle the fans via curl.
+  # Daemon / scripts use these creds for HTTP Basic on /text/rf_tx/set.
+  auth:
+    username: !secret web_username
+    password: !secret web_password
 
 # ---------------------------------------------------------------------------
 # CC1101 radio (built into ESPHome since esphome/esphome#11849).
