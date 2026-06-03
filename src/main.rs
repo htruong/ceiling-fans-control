@@ -676,7 +676,14 @@ async fn main() {
 
     // Optional HomeKit bridge
     if let Some(hk_cfg) = daemon.config.homekit.as_ref().filter(|c| c.enabled) {
-        let rooms: Vec<String> = daemon.config.fans.keys().cloned().collect();
+        // Sort for stable iteration order. HomeKit assigns each accessory
+        // an AID by position in this slice, and iOS Home keys persistent
+        // metadata (most visibly: room assignment) off (bridge_id, AID).
+        // HashMap::keys() iterates in a per-process-random order, so
+        // without sorting the AIDs reshuffle on every restart and the
+        // Home app sees each fan as having moved rooms.
+        let mut rooms: Vec<String> = daemon.config.fans.keys().cloned().collect();
+        rooms.sort();
         let pin_bytes = parse_pin(&hk_cfg.pin);
         let bridge_name = hk_cfg.name.clone().unwrap_or_else(hostname);
         let bind_ip: std::net::IpAddr = hk_cfg.bind.parse()
