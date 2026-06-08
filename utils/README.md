@@ -19,9 +19,6 @@ and to help debug new fans.
 - **`decode_fan_remote.py`** — the other direction: decodes a recorded OOK
   capture from the physical remote into the raw bits, so you can work out
   the `FAN_ID` of a new fan.
-- **`generate_esphome_config.py`** — emits an ESPHome YAML for an ESP32
-  + CC1101 board that mirrors this behaviour. Not used by the daemon, but
-  handy if you want to drive fans from an ESPHome node instead of a Pi.
 - **`homekit_bridge.py`** — the old pyhap-based HomeKit bridge. Superseded
   by the Rust daemon's native HAP support (`src/homekit.rs`), but kept
   because it's a short, readable example of a combined Fan + Lightbulb

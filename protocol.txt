@@ -245,20 +245,22 @@
   10. RELATED CODE IN THIS REPO
 ==============================================================================
 
-  control_fan.py              TX side. Uses CMDS (7-bit) and FAN_IDS
-                              (14-bit) loaded from config.yaml. No
-                              per-fan transformations.
+  fan-remote.yaml             Production ESPHome firmware for the ESP32 +
+                              CC1101 TX bridge. Bit-length agnostic
+                              encoder (`script: do_transmit`) shared by
+                              two transports (HA-native action +
+                              web_server text entity).
 
-  config.yaml                 Stores 14-bit FAN_IDs per room.
+  control_fan.py              Python reference TX implementation. Uses
+                              CMDS (7-bit) and FAN_IDS (14-bit) loaded
+                              from config.yaml; shells out to sendook on
+                              a Pi. Pre-ESPHome — kept as readable proof
+                              of the protocol.
 
-  generate_esphome_config.py  Produces the binary_sensor block for the
-                              ESPHome receiver. Mirrors CMDS and FAN_IDS
-                              from control_fan.py / config.yaml.
+  config.yaml                 Stores 14-bit FAN_IDs per room. Read by
+                              control_fan.py and the onlyfansd daemon.
 
-  fan-remote1.yaml            Full ESPHome config for the CC1101 receiver
-                              node. Includes SPI + CC1101 + remote_receiver
-                              + 40 binary_sensors (10 buttons × 4 fans).
-
-  decode_fan_remote.py        Offline decoder for ESPHome "Received Raw:"
-                              log events. Splits messages as 4+14+7,
-                              labels trailer cmdids explicitly.
+  decode_fan_remote.py        Offline decoder for "Received Raw:" log
+                              lines. Splits messages as 4+14+7, labels
+                              trailer cmdids explicitly. Useful for
+                              sniffing a new fan's FAN_ID.

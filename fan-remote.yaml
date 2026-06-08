@@ -1,12 +1,12 @@
-# Casa Vieja ceiling-fan remote bridge (ESP32 + CC1101).
+# Casa Vieja ceiling-fan remote bridge (ESP32 + CC1101). TX-only.
 #
 # Deploy this firmware ONCE. All fan-specific config (fan IDs, commands)
-# lives in Home Assistant — see the "TX from HA" notes at the bottom.
+# lives in Home Assistant or whatever calls the transmit endpoints.
 #
 # Hardware:
 #   SPI: CLK=GPIO18, MOSI=GPIO23, MISO=GPIO19, CS=GPIO5
 #   CC1101 GDO0 -> GPIO22 (TX data into CC1101)
-#   CC1101 GDO2 -> GPIO21 (RX data out of CC1101)
+#   (GDO2 is unused — this firmware never listens.)
 #
 # Protocol: 304.30 MHz OOK, 333us per chip, 25-bit messages.
 # Each bit b -> chips "10b". See protocol.txt.
@@ -17,6 +17,9 @@ esphome:
 
 esp32:
   board: esp32dev
+  framework:
+    advanced:
+      sram1_as_iram: true   # +40KB IRAM the bootloader supports but ESPHome doesn't claim by default
 
 logger:
   level: DEBUG
@@ -39,16 +42,22 @@ script:
           then:
             - remote_transmitter.transmit_raw:
                 code: !lambda |-
-                  // Encode each bit b -> chips "10b", then RLE-compress
-                  // consecutive same chips into +/- microsecond pulses.
+                  ESP_LOGI("fan-remote", "TX bits=%s", bits.c_str());
+                  // Encode each bit b -> chips "10b", then append 30
+                  // silent chips (~10ms) so each frame carries its own
+                  // inter-burst pause. This lets us run the transmitter
+                  // in non_blocking mode without needing a separate
+                  // `delay:` action between repeats.
                   const int CHIP_US = 333;
                   std::string chips;
-                  chips.reserve(bits.size() * 3);
+                  chips.reserve(bits.size() * 3 + 30);
                   for (char b : bits) {
                     chips += '1';
                     chips += '0';
                     chips += b;
                   }
+                  chips.append(30, '0');
+                  // RLE-compress runs of identical chips into +/- microsecond pulses.
                   std::vector<int32_t> pulses;
                   size_t i = 0;
                   while (i < chips.size()) {
@@ -59,12 +68,7 @@ script:
                     pulses.push_back(level == '1' ? dur : -dur);
                     i += run;
                   }
-                  // Drop trailing LOW so the inter-burst pause below isn't
-                  // doubled with the message's tail silence.
-                  while (!pulses.empty() && pulses.back() < 0) pulses.pop_back();
                   return pulses;
-            # ~10ms inter-burst pause (matches the real remote's cadence)
-            - delay: 10ms
 
 # Transport #1: Home Assistant native API.
 # Call as: action esphome.fan_remote1_transmit_fan_bits
@@ -127,13 +131,6 @@ wifi:
 
 captive_portal:
 
-# Use spare ESP32 BT radio as a Bluetooth proxy for HA — forwards nearby
-# BLE devices (e.g. xiaomi temp sensors, plant monitors) over WiFi.
-esp32_ble_tracker:
-
-bluetooth_proxy:
-  active: true   # let HA initiate connections (not just passive scanning)
-
 web_server:
   # Basic auth so anyone on the LAN can't toggle the fans via curl.
   # Daemon / scripts use these creds for HTTP Basic on /text/rf_tx/set.
@@ -143,8 +140,7 @@ web_server:
 
 # ---------------------------------------------------------------------------
 # CC1101 radio (built into ESPHome since esphome/esphome#11849).
-# GDO0 (TX data in) -> GPIO22
-# GDO2 (RX data out) -> GPIO21
+# TX-only. GDO0 (TX data in) -> GPIO22. GDO2 left unconnected.
 # ---------------------------------------------------------------------------
 
 spi:
@@ -160,222 +156,41 @@ cc1101:
   frequency: 304.30MHz
   modulation_type: ASK/OOK
   filter_bandwidth: 203kHz
-  symbol_rate: 4800
-  output_power: 10   # dBm — near max for the 300 MHz band; default is ~0
+  # Our chip duration is 333us → ~3000 baud. Mismatched symbol_rate
+  # affects the modulator's oversampling / pulse shaping in async
+  # serial OOK mode and was the leading suspect for flaky TX.
+  symbol_rate: 3000
+  output_power: 11   # dBm — max the chip supports (was 10)
 
-# ---------------------------------------------------------------------------
-# TX side — generic raw OOK out of CC1101 GDO0.
-# on_transmit/on_complete drive the CC1101 in and out of TX mode so the
-# rest of the time the radio is listening (for the RX binary_sensors below).
-# ---------------------------------------------------------------------------
-
+# Generic raw OOK out of CC1101 GDO0. The chip is parked in idle and
+# only flipped into TX mode for the duration of a frame.
 remote_transmitter:
   id: tx
   pin: GPIO22
   carrier_duty_percent: 100%   # OOK: CC1101 supplies the carrier, we just gate it
   eot_level: false
-  # Block until each frame is on the air. With non_blocking: true (the new
-  # default) the `repeat` + `delay` below would run while transmit is still
-  # pending, breaking the inter-burst timing and overflowing the queue.
-  non_blocking: false
+  # Each frame already contains its trailing ~10ms silence (see the
+  # encoder lambda), so back-to-back queued frames carry the correct
+  # inter-burst pause without us having to block the action chain.
+  non_blocking: true
   on_transmit:
     then:
+      # set_idle → begin_tx forces a fresh PLL calibration before each
+      # frame (idle→tx transition triggers SCAL). Skipping it costs no
+      # latency you'll notice and sometimes the synth drifts enough that
+      # the fan's narrow front-end rejects an otherwise-valid frame.
       - cc1101.set_idle
       - cc1101.begin_tx
   on_complete:
     then:
       - cc1101.set_idle
-      - cc1101.begin_rx
 
 # ---------------------------------------------------------------------------
-# RX side — listens on CC1101 GDO2.
-# Patterns below are for parents_room only (FAN_ID 01011111101000).
-# Regenerate with: `python utils/generate_esphome_config.py`.
-# ---------------------------------------------------------------------------
-
-remote_receiver:
-  id: rx
-  pin:
-    number: GPIO21
-    mode:
-      input: true
-  dump: raw
-  idle: 8ms
-  filter: 150us
-  tolerance: 50%
-
-binary_sensor:
-  - platform: remote_receiver
-    name: "Fan parents_room reverse"
-    id: fan_parents_room_reverse
-    filters:
-      # Hold "pressed" for 500ms so the remote's 3-5 retransmits-per-press
-      # don't each generate their own edge to HA. on_press fires once per
-      # physical button press.
-      - delayed_off: 500ms
-    raw:
-      code: [333, -333, 666, -333, 666, -333, 666, -333, 666, -666, 333, -333, 666, -666, 333, -333, 666, -333, 666, -333, 666, -333, 666, -333, 666, -333, 666, -666, 333, -333, 666, -666, 333, -666, 333, -666, 333, -666, 333, -666, 333, -666, 333, -333, 666, -666, 333, -666, 333]
-    on_press:
-      then:
-        - logger.log:
-            level: INFO
-            tag: "fan-remote"
-            format: "%s pressed"
-            args: ['"Fan parents_room reverse"']
-
-  - platform: remote_receiver
-    name: "Fan parents_room light"
-    id: fan_parents_room_light
-    filters:
-      # Hold "pressed" for 500ms so the remote's 3-5 retransmits-per-press
-      # don't each generate their own edge to HA. on_press fires once per
-      # physical button press.
-      - delayed_off: 500ms
-    raw:
-      code: [333, -333, 666, -333, 666, -333, 666, -333, 666, -666, 333, -333, 666, -666, 333, -333, 666, -333, 666, -333, 666, -333, 666, -333, 666, -333, 666, -666, 333, -333, 666, -666, 333, -666, 333, -666, 333, -666, 333, -666, 333, -666, 333, -666, 333, -666, 333, -333, 666]
-    on_press:
-      then:
-        - logger.log:
-            level: INFO
-            tag: "fan-remote"
-            format: "%s pressed"
-            args: ['"Fan parents_room light"']
-
-  - platform: remote_receiver
-    name: "Fan parents_room stop"
-    id: fan_parents_room_stop
-    filters:
-      # Hold "pressed" for 500ms so the remote's 3-5 retransmits-per-press
-      # don't each generate their own edge to HA. on_press fires once per
-      # physical button press.
-      - delayed_off: 500ms
-    raw:
-      code: [333, -333, 666, -333, 666, -333, 666, -333, 666, -666, 333, -333, 666, -666, 333, -333, 666, -333, 666, -333, 666, -333, 666, -333, 666, -333, 666, -666, 333, -333, 666, -666, 333, -666, 333, -666, 333, -666, 333, -666, 333, -666, 333, -666, 333, -333, 666, -666, 333]
-    on_press:
-      then:
-        - logger.log:
-            level: INFO
-            tag: "fan-remote"
-            format: "%s pressed"
-            args: ['"Fan parents_room stop"']
-
-  - platform: remote_receiver
-    name: "Fan parents_room speed1"
-    id: fan_parents_room_speed1
-    filters:
-      # Hold "pressed" for 500ms so the remote's 3-5 retransmits-per-press
-      # don't each generate their own edge to HA. on_press fires once per
-      # physical button press.
-      - delayed_off: 500ms
-    raw:
-      code: [333, -333, 666, -333, 666, -333, 666, -333, 666, -666, 333, -333, 666, -666, 333, -333, 666, -333, 666, -333, 666, -333, 666, -333, 666, -333, 666, -666, 333, -333, 666, -666, 333, -666, 333, -666, 333, -666, 333, -666, 333, -333, 666, -666, 333, -666, 333, -666, 333]
-    on_press:
-      then:
-        - logger.log:
-            level: INFO
-            tag: "fan-remote"
-            format: "%s pressed"
-            args: ['"Fan parents_room speed1"']
-
-  - platform: remote_receiver
-    name: "Fan parents_room speed2"
-    id: fan_parents_room_speed2
-    filters:
-      # Hold "pressed" for 500ms so the remote's 3-5 retransmits-per-press
-      # don't each generate their own edge to HA. on_press fires once per
-      # physical button press.
-      - delayed_off: 500ms
-    raw:
-      code: [333, -333, 666, -333, 666, -333, 666, -333, 666, -666, 333, -333, 666, -666, 333, -333, 666, -333, 666, -333, 666, -333, 666, -333, 666, -333, 666, -666, 333, -333, 666, -666, 333, -666, 333, -666, 333, -666, 333, -666, 333, -333, 666, -666, 333, -333, 666, -666, 333]
-    on_press:
-      then:
-        - logger.log:
-            level: INFO
-            tag: "fan-remote"
-            format: "%s pressed"
-            args: ['"Fan parents_room speed2"']
-
-  - platform: remote_receiver
-    name: "Fan parents_room speed3"
-    id: fan_parents_room_speed3
-    filters:
-      # Hold "pressed" for 500ms so the remote's 3-5 retransmits-per-press
-      # don't each generate their own edge to HA. on_press fires once per
-      # physical button press.
-      - delayed_off: 500ms
-    raw:
-      code: [333, -333, 666, -333, 666, -333, 666, -333, 666, -666, 333, -333, 666, -666, 333, -333, 666, -333, 666, -333, 666, -333, 666, -333, 666, -333, 666, -666, 333, -333, 666, -666, 333, -666, 333, -666, 333, -666, 333, -333, 666, -666, 333, -666, 333, -666, 333, -666, 333]
-    on_press:
-      then:
-        - logger.log:
-            level: INFO
-            tag: "fan-remote"
-            format: "%s pressed"
-            args: ['"Fan parents_room speed3"']
-
-  - platform: remote_receiver
-    name: "Fan parents_room speed4"
-    id: fan_parents_room_speed4
-    filters:
-      # Hold "pressed" for 500ms so the remote's 3-5 retransmits-per-press
-      # don't each generate their own edge to HA. on_press fires once per
-      # physical button press.
-      - delayed_off: 500ms
-    raw:
-      code: [333, -333, 666, -333, 666, -333, 666, -333, 666, -666, 333, -333, 666, -666, 333, -333, 666, -333, 666, -333, 666, -333, 666, -333, 666, -333, 666, -666, 333, -333, 666, -666, 333, -666, 333, -666, 333, -666, 333, -333, 666, -333, 666, -666, 333, -666, 333, -666, 333]
-    on_press:
-      then:
-        - logger.log:
-            level: INFO
-            tag: "fan-remote"
-            format: "%s pressed"
-            args: ['"Fan parents_room speed4"']
-
-  - platform: remote_receiver
-    name: "Fan parents_room speed5"
-    id: fan_parents_room_speed5
-    filters:
-      # Hold "pressed" for 500ms so the remote's 3-5 retransmits-per-press
-      # don't each generate their own edge to HA. on_press fires once per
-      # physical button press.
-      - delayed_off: 500ms
-    raw:
-      code: [333, -333, 666, -333, 666, -333, 666, -333, 666, -666, 333, -333, 666, -666, 333, -333, 666, -333, 666, -333, 666, -333, 666, -333, 666, -333, 666, -666, 333, -333, 666, -666, 333, -666, 333, -666, 333, -333, 666, -666, 333, -666, 333, -666, 333, -333, 666, -666, 333]
-    on_press:
-      then:
-        - logger.log:
-            level: INFO
-            tag: "fan-remote"
-            format: "%s pressed"
-            args: ['"Fan parents_room speed5"']
-
-  - platform: remote_receiver
-    name: "Fan parents_room speed6"
-    id: fan_parents_room_speed6
-    filters:
-      # Hold "pressed" for 500ms so the remote's 3-5 retransmits-per-press
-      # don't each generate their own edge to HA. on_press fires once per
-      # physical button press.
-      - delayed_off: 500ms
-    raw:
-      code: [333, -333, 666, -333, 666, -333, 666, -333, 666, -666, 333, -333, 666, -666, 333, -333, 666, -333, 666, -333, 666, -333, 666, -333, 666, -333, 666, -666, 333, -333, 666, -666, 333, -666, 333, -666, 333, -333, 666, -666, 333, -666, 333, -666, 333, -666, 333, -666, 333]
-    on_press:
-      then:
-        - logger.log:
-            level: INFO
-            tag: "fan-remote"
-            format: "%s pressed"
-            args: ['"Fan parents_room speed6"']
-
-# ---------------------------------------------------------------------------
-# TX from HA — call the action like this:
+# TX examples — call either transport with:
 #
-#   service: esphome.fan_remote_transmit_fan_bits
-#   data:
-#     bits: "111101011111101000{cmdid}"   # "1111" + parents_room id + cmdid
-#     repeat: 4
+#   bits = "1111" + 14-bit FAN_ID + 7-bit cmdid
 #
-# Examples for parents_room (FAN_ID 01011111101000):
+# parents_room (FAN_ID 01011111101000):
 #   light   -> bits: "1111010111111010000000010"
 #   stop    -> bits: "1111010111111010000000100"
 #   speed1  -> bits: "1111010111111010000010000"
@@ -386,5 +201,10 @@ binary_sensor:
 #   speed6  -> bits: "1111010111111010001000000"
 #   reverse -> bits: "1111010111111010000001000"
 #
-# Put these in HA scripts/automations or build them with templates. Adding a
-# new fan = adding a new HA script; no firmware reflash needed.
+# HA action:
+#   service: esphome.fan_remote1_transmit_fan_bits
+#   data: { bits: "...", repeat: 4 }
+#
+# Plain HTTP:
+#   POST http://fan-remote1.local/text/rf_tx/set?value=<bits>:<repeat>:<nonce>
+# ---------------------------------------------------------------------------
