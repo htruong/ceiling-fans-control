@@ -1,28 +1,29 @@
-# Home Assistant — required. The daemon uses HA's REST API to drive the
-# ESPHome RF bridge (see `esphome:` below), and optionally listens on HA's
-# WebSocket for inbound `call_service` events on fan/light entities.
+# Home Assistant — required. Used for the HA-mediated RF transport (when
+# rf.transport ∈ {ha_rest, http}) and, when listen: true, to subscribe to
+# `call_service` events and mirror entity state back to HA via REST.
+# When rf.transport: spi, only `listen` and the REST mirror are used —
+# the URL/token can still be omitted for a fully local deployment by
+# setting listen: false.
 homeassistant:
   url: http://homeassistant.local:8123
   token: your_long_lived_access_token
   # If true (default), subscribe to HA's WebSocket for service calls and
   # mirror entity state back to HA via REST. Set to false for a
-  # HomeKit-only deployment that still uses HA REST as a proxy to ESPHome.
+  # HomeKit-only / SPI-direct deployment that doesn't talk to HA at all.
   listen: true
 
-# ESPHome RF bridge — required. The daemon assembles a 25-bit OOK frame
-# (preamble + fan_id + cmdid) and ships it to the ESPHome node.
+# RF transport — required.
+rf:
+  # ha_rest — POST to HA's REST API; HA proxies to ESPHome over its native link.
+  # http    — POST directly to the ESPHome web_server; bypasses HA entirely.
+  # spi     — drive a locally-attached CC1101 over SPI (Pi-native). Linux-only.
+  transport: ha_rest
+  repeat: 4   # retransmits per command (physical remote does 3-5)
+
+# Required when transport ∈ {ha_rest, http}. Omit for transport: spi.
 esphome:
   device: fan_remote1   # ESPHome `name:` (underscored form). Used as the
                         # HA service suffix on the ha_rest transport.
-  repeat: 4             # retransmits per command (physical remote does 3-5)
-
-  # Transport: how the daemon delivers the frame.
-  #   ha_rest  (default) — POST to HA's REST API; HA proxies the
-  #                        `transmit_fan_bits` action over its native link.
-  #   http               — POST directly to the ESPHome web_server on the
-  #                        device. Bypasses HA entirely. Survives HA
-  #                        outages but needs the `http:` block below.
-  transport: ha_rest
 
   # Required only when transport: http.
   # http:
@@ -30,6 +31,13 @@ esphome:
   #   port: 80                     # default 80
   #   username: !secret web_user   # match web_server.auth in fan-remote.yaml
   #   password: !secret web_pass   # omit both if web_server.auth is unset
+
+# Required when transport: spi. Drives a CC1101 wired directly to the host
+# (e.g. a Pi Zero W) over SPI in packet/FIFO mode. See README.md for wiring.
+# cc1101:
+#   device: /dev/spidev0.0   # default; SPI0 / CE0 on a Pi with the default overlay
+#   frequency_hz: 304300000  # default 304.30 MHz (Casa Vieja TR301A)
+#   power: 0xC0              # default; PATABLE[1] "carrier on" byte (~+11 dBm)
 
 # 14-bit FAN_IDs (as strings of '0'/'1'). Sniff them off the remote with
 # decode_fan_remote.py, or pair arbitrary IDs using the fan's SET button —

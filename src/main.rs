@@ -1,5 +1,8 @@
 mod homekit;
 
+#[cfg(target_os = "linux")]
+mod cc1101;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,7 +21,13 @@ use tracing::{error, info, warn};
 #[derive(Deserialize)]
 struct Config {
     homeassistant: HaConfig,
-    esphome: EspHomeConfig,
+    rf: RfConfig,
+    // Required when rf.transport ∈ {ha_rest, http}.
+    #[serde(default)]
+    esphome: Option<EspHomeConfig>,
+    // Required when rf.transport = spi.
+    #[serde(default)]
+    cc1101: Option<Cc1101Config>,
     fans: HashMap<String, String>, // room → 14-bit fan ID string
     #[serde(default)]
     homekit: Option<HomeKitConfig>,
@@ -36,24 +45,23 @@ struct HaConfig {
 }
 
 #[derive(Deserialize)]
-struct EspHomeConfig {
-    // ESPHome device name (underscored form). Used as the HA service
-    // suffix on the ha_rest transport.
-    device: String,
-    // Retransmissions per command. The physical remote sends 3–5;
+struct RfConfig {
+    // How the daemon emits the 25-bit OOK frame:
+    //   ha_rest (default) — POST to HA's REST API, which proxies the
+    //     `transmit_fan_bits` action over HA's native ESPHome link.
+    //     Requires the `esphome:` block.
+    //   http              — POST directly to the ESPHome device's
+    //     web_server REST endpoint. Bypasses HA. Requires the
+    //     `esphome:` block (with an `esphome.http:` sub-block).
+    //   spi               — drive a locally-attached CC1101 over SPI
+    //     (Pi-native). No ESPHome involved. Requires the `cc1101:`
+    //     block and a Linux build.
+    #[serde(default = "default_transport")]
+    transport: Transport,
+    // Retransmissions per command. The physical remote sends 3-5;
     // 4 is a fine default.
     #[serde(default = "default_repeat")]
     repeat: u32,
-    // How the daemon delivers the RF frame to the ESPHome bridge:
-    //   ha_rest (default) — POST to HA's REST API, which proxies the
-    //     `transmit_fan_bits` action over HA's native ESPHome link.
-    //   http              — POST directly to the ESPHome device's
-    //     web_server REST endpoint. Bypasses HA entirely; useful if HA
-    //     reliability is a concern. Requires the matching `http:` block.
-    #[serde(default = "default_transport")]
-    transport: Transport,
-    #[serde(default)]
-    http: Option<EspHomeHttpConfig>,
 }
 
 #[derive(Deserialize, Clone, Copy, Debug, PartialEq)]
@@ -61,6 +69,17 @@ struct EspHomeConfig {
 enum Transport {
     HaRest,
     Http,
+    Spi,
+}
+
+#[derive(Deserialize)]
+struct EspHomeConfig {
+    // ESPHome device name (underscored form). Used as the HA service
+    // suffix on the ha_rest transport.
+    device: String,
+    // Required for transport: http; ignored for transport: ha_rest.
+    #[serde(default)]
+    http: Option<EspHomeHttpConfig>,
 }
 
 #[derive(Deserialize)]
@@ -78,10 +97,31 @@ struct EspHomeHttpConfig {
     password: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct Cc1101Config {
+    // SPI character device. On a Raspberry Pi with the default overlay,
+    // SPI0 with CE0 selected is /dev/spidev0.0.
+    #[serde(default = "default_spi_device")]
+    device: String,
+    // Carrier frequency in Hz. Default targets Casa Vieja TR301A
+    // (304.30 MHz). The driver computes the FREQ register from this.
+    #[serde(default = "default_frequency_hz")]
+    frequency_hz: u32,
+    // CC1101 PATABLE[1] byte — the "carrier on" PA setting in OOK mode.
+    // 0xC0 is the canonical "max power, 315 MHz band" entry (~+11 dBm).
+    // Lower values trade range for current draw and spectral cleanliness.
+    #[serde(default = "default_power")]
+    power: u8,
+}
+
 fn default_true() -> bool { true }
 fn default_repeat() -> u32 { 4 }
 fn default_transport() -> Transport { Transport::HaRest }
 fn default_http_port() -> u16 { 80 }
+fn default_spi_device() -> String { "/dev/spidev0.0".into() }
+fn default_frequency_hz() -> u32 { 304_300_000 }
+fn default_power() -> u8 { 0xC0 }
 
 #[derive(Deserialize)]
 struct HomeKitConfig {
@@ -245,14 +285,27 @@ fn title_case(s: &str) -> String {
 
 // ── Daemon ────────────────────────────────────────────────────────────────────
 
+// Pi-native CC1101 handle. Wrapped in a std Mutex since the underlying
+// spidev calls are blocking and we serialise transmits via spawn_blocking.
+// Aliased so the Daemon struct compiles on non-Linux (where the handle is
+// always None and the SPI code path is cfg'd out).
+#[cfg(target_os = "linux")]
+type Cc1101Handle = Arc<std::sync::Mutex<cc1101::Cc1101>>;
+#[cfg(not(target_os = "linux"))]
+type Cc1101Handle = ();
+
 struct Daemon {
     config: Config,
     client: Client,
     state: Mutex<SharedState>,
     homekit: Option<Arc<homekit::HomeKit>>,
+    // Local CC1101 radio, present only when rf.transport = spi (and only
+    // ever Some on Linux builds).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    radio: Option<Cc1101Handle>,
     // Monotonic counter appended to HTTP-transport payloads so two
     // consecutive identical commands (e.g. light, light) don't get
-    // deduped by ESPHome's text entity. Unused for the ha_rest path.
+    // deduped by ESPHome's text entity. Unused for ha_rest / spi.
     nonce: AtomicU64,
 }
 
@@ -268,13 +321,14 @@ impl Daemon {
             client: Client::new(),
             state: Mutex::new(state),
             homekit: None,
+            radio: None,
             nonce: AtomicU64::new(0),
         }
     }
 
-    /// Send an RF command. Dispatches to either HA's REST API (which then
-    /// proxies to ESPHome) or directly to the ESPHome device's web_server,
-    /// depending on `esphome.transport`.
+    /// Send an RF command. Dispatches per `rf.transport` to HA's REST API
+    /// (HA → ESPHome → CC1101), the ESPHome web_server (direct HTTP →
+    /// ESPHome → CC1101), or a locally-attached CC1101 over SPI.
     async fn send_rf(&self, fan_id: &str, cmd: &str) {
         let cmdid = match CMDS.iter().find(|(k, _)| *k == cmd) {
             Some((_, v)) => *v,
@@ -286,24 +340,32 @@ impl Daemon {
 
         info!(
             "RF → {} {} (bits={}, repeat={}, transport={:?})",
-            fan_id, cmd, bits, self.config.esphome.repeat, self.config.esphome.transport,
+            fan_id, cmd, bits, self.config.rf.repeat, self.config.rf.transport,
         );
 
-        match self.config.esphome.transport {
+        match self.config.rf.transport {
             Transport::HaRest => self.send_rf_ha_rest(fan_id, cmd, &bits).await,
             Transport::Http   => self.send_rf_http(fan_id, cmd, &bits).await,
+            Transport::Spi    => self.send_rf_spi(fan_id, cmd, bits).await,
         }
     }
 
     async fn send_rf_ha_rest(&self, fan_id: &str, cmd: &str, bits: &str) {
+        let esp = match &self.config.esphome {
+            Some(e) => e,
+            None => {
+                error!("rf.transport=ha_rest but no esphome: block");
+                return;
+            }
+        };
         let ha = &self.config.homeassistant;
         let endpoint = format!(
             "{}/api/services/esphome/{}_transmit_fan_bits",
-            ha.url, self.config.esphome.device,
+            ha.url, esp.device,
         );
         match self.client.post(&endpoint)
             .header("Authorization", format!("Bearer {}", ha.token))
-            .json(&json!({ "bits": bits, "repeat": self.config.esphome.repeat }))
+            .json(&json!({ "bits": bits, "repeat": self.config.rf.repeat }))
             .timeout(Duration::from_secs(5))
             .send()
             .await
@@ -315,10 +377,10 @@ impl Daemon {
     }
 
     async fn send_rf_http(&self, fan_id: &str, cmd: &str, bits: &str) {
-        let http = match &self.config.esphome.http {
+        let http = match self.config.esphome.as_ref().and_then(|e| e.http.as_ref()) {
             Some(h) => h,
             None => {
-                error!("esphome.transport=http but no esphome.http config block");
+                error!("rf.transport=http but no esphome.http: block");
                 return;
             }
         };
@@ -328,7 +390,7 @@ impl Daemon {
         // Modulo keeps the URL short (5 digits max) — long URLs have
         // tripped ESPHome's IDF web_server in testing.
         let nonce = self.nonce.fetch_add(1, Ordering::Relaxed) % 100_000;
-        let value = format!("{}:{}:{}", bits, self.config.esphome.repeat, nonce);
+        let value = format!("{}:{}:{}", bits, self.config.rf.repeat, nonce);
         let url = format!("http://{}:{}/text/rf_tx/set", http.host, http.port);
 
         let mut req = self.client.post(&url)
@@ -348,6 +410,38 @@ impl Daemon {
             Ok(r) => error!("RF {} {} → HTTP {}", fan_id, cmd, r.status()),
             Err(e) => error!("RF {} {} failed: {}", fan_id, cmd, e),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn send_rf_spi(&self, fan_id: &str, cmd: &str, bits: String) {
+        let radio = match self.radio.as_ref() {
+            Some(r) => Arc::clone(r),
+            None => {
+                error!("rf.transport=spi but radio not initialised");
+                return;
+            }
+        };
+        let repeat = self.config.rf.repeat;
+        let fan_id = fan_id.to_string();
+        let cmd = cmd.to_string();
+        // spidev calls are blocking — hop to the blocking pool so the runtime
+        // keeps serving WS / HTTP / HomeKit work while a frame is on the air
+        // (~150 ms for 4 retransmits of a 25-bit frame at 3000 baud).
+        let res = tokio::task::spawn_blocking(move || {
+            let mut guard = radio.lock().expect("CC1101 mutex poisoned");
+            guard.transmit(&bits, repeat)
+        })
+        .await;
+        match res {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => error!("RF {} {} → SPI failed: {}", fan_id, cmd, e),
+            Err(e) => error!("RF {} {} → SPI join failed: {}", fan_id, cmd, e),
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    async fn send_rf_spi(&self, fan_id: &str, cmd: &str, _bits: String) {
+        error!("RF {} {} → SPI transport not supported on this OS (Linux only)", fan_id, cmd);
     }
 
     async fn sync_fan_to_ha(&self, room: &str, st: &FanState) {
@@ -668,11 +762,48 @@ async fn main() {
     let config: Config = serde_yaml::from_str(&raw)
         .unwrap_or_else(|e| panic!("Cannot parse {}: {}", config_path, e));
 
-    if config.esphome.transport == Transport::Http && config.esphome.http.is_none() {
-        panic!("esphome.transport=http requires an esphome.http: {{ host, ... }} block");
+    // Transport ↔ config-block consistency. We validate up-front rather than
+    // erroring per-frame so a misconfigured deployment fails loudly at boot.
+    match config.rf.transport {
+        Transport::HaRest => {
+            if config.esphome.is_none() {
+                panic!("rf.transport=ha_rest requires an esphome: {{ device, ... }} block");
+            }
+        }
+        Transport::Http => {
+            let http_ok = config.esphome.as_ref()
+                .and_then(|e| e.http.as_ref())
+                .is_some();
+            if !http_ok {
+                panic!("rf.transport=http requires an esphome.http: {{ host, ... }} block");
+            }
+        }
+        Transport::Spi => {
+            if config.cc1101.is_none() {
+                panic!("rf.transport=spi requires a cc1101: {{ device, ... }} block");
+            }
+            #[cfg(not(target_os = "linux"))]
+            panic!("rf.transport=spi is Linux-only (spidev unavailable on this OS)");
+        }
     }
 
     let mut daemon = Daemon::new(config);
+
+    // Bring up the locally-attached CC1101 if we're driving it directly.
+    #[cfg(target_os = "linux")]
+    if daemon.config.rf.transport == Transport::Spi {
+        let cfg = daemon.config.cc1101.as_ref().expect("validated above");
+        info!(
+            "Initialising CC1101 on {} @ {} Hz, PA=0x{:02X}",
+            cfg.device, cfg.frequency_hz, cfg.power,
+        );
+        let mut radio = cc1101::Cc1101::open(&cfg.device)
+            .unwrap_or_else(|e| panic!("Cannot open {}: {}", cfg.device, e));
+        radio.init(cfg.frequency_hz, cfg.power)
+            .unwrap_or_else(|e| panic!("CC1101 init failed: {}", e));
+        daemon.radio = Some(Arc::new(std::sync::Mutex::new(radio)));
+        info!("CC1101 ready");
+    }
 
     // Optional HomeKit bridge
     if let Some(hk_cfg) = daemon.config.homekit.as_ref().filter(|c| c.enabled) {

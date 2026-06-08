@@ -20,6 +20,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 hap = { path = "vendor/hap-rs" }
 
+# Pi-native SPI transport (direct CC1101). Linux-only — spidev wraps the
+# /dev/spidev* ioctls. On macOS/Windows the `transport: spi` path is
+# cfg-gated out and selecting it at runtime panics at startup.
+[target.'cfg(target_os = "linux")'.dependencies]
+spidev = "0.6"
+
 [profile.release]
 opt-level = "z"
 lto = true
